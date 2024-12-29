@@ -1,0 +1,22 @@
+[package]
+name = "hyproxy"
+version = "0.1.0"
+edition = "2021"
+description = "Proxy helpers for hyper services"
+license = "MIT"
+repository = "https://github.com/alexrudy/hyproxy"
+documentation = "https://docs.rs/hyproxy"
+rust-version = "1.74"
+readme = "README.md"
+authors = ["Alex Rudy <opensource@alexrudy.net>"]
+categories = ["network-programming", "web-programming::http-server"]
+keywords = ["hyper", "http", "server", "async"]
+
+
+[dependencies]
+hyperdriver = { version = "0.8.5", features = ["stream"] }
+http = "1.2.0"
+thiserror = "2.0.9"
+tracing = "0.1.41"
+tower = "0.5.2"
+tokio = { version = "1", features = ["macros"] }
