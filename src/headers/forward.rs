@@ -9,6 +9,8 @@ use std::{
 use hyperdriver::info::ConnectionInfo;
 use thiserror::Error;
 
+use super::is_rfc7230_token;
+
 /// The `Forwarded` header, a standard header for identifying the originating IP address of a client connecting to a web server through a proxy server.
 ///
 /// This header is defined in [RFC-7239](https://datatracker.ietf.org/doc/html/rfc7239).
@@ -309,9 +311,37 @@ impl FromStr for Forwarded {
             }
 
             match key {
-                "by" => insert_or_error(&mut by, value.into(), key)?,
-                "for" => insert_or_error(&mut r#for, value.into(), key)?,
-                "host" => insert_or_error(&mut host, value.into(), key)?,
+                "by" => insert_or_error(
+                    &mut by,
+                    value.parse().map_err(|error| ParseForwardedError {
+                        kind: ParseForwadingErrorKind::InvalidToken {
+                            key: key.to_string(),
+                            error,
+                        },
+                    })?,
+                    key,
+                )?,
+                "for" => insert_or_error(
+                    &mut r#for,
+                    value.parse().map_err(|error| ParseForwardedError {
+                        kind: ParseForwadingErrorKind::InvalidToken {
+                            key: key.to_string(),
+                            error,
+                        },
+                    })?,
+                    key,
+                )?,
+                "host" => insert_or_error(
+                    &mut host,
+                    value
+                        .parse::<http::uri::Authority>()
+                        .map_err(|error| ParseForwardedError {
+                            kind: ParseForwadingErrorKind::InvalidHost { error },
+                        })?
+                        .host()
+                        .to_owned(),
+                    key,
+                )?,
                 "proto" => {
                     let value = value.parse().map_err(|error| ParseForwardedError {
                         kind: ParseForwadingErrorKind::InvalidScheme {
@@ -348,6 +378,19 @@ enum ParseForwadingErrorKind {
 
     #[error("invalid key for FORWARDED: {0}")]
     InvalidKey(String),
+
+    #[error("invalid characters in token for FORWARDED ({key}): {error}")]
+    InvalidToken {
+        key: String,
+        #[source]
+        error: InvalidToken,
+    },
+
+    #[error("invalid host for FORWARDED (host): {error}")]
+    InvalidHost {
+        #[source]
+        error: http::uri::InvalidUri,
+    },
 
     #[error("invalid protocol for FORWARDED ({key}): {error}")]
     InvalidScheme {
@@ -419,16 +462,24 @@ impl From<SocketAddr> for Forwardee {
     }
 }
 
-impl From<&str> for Forwardee {
-    fn from(name: &str) -> Self {
+/// Error indicating that a chacracter in a token is not valid.
+#[derive(Debug, Error)]
+#[error("invalid token: {0}")]
+pub struct InvalidToken(String);
+
+impl FromStr for Forwardee {
+    type Err = InvalidToken;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
         if let Ok(addr) = name.parse::<ForwardAddress>() {
-            return Forwardee::Address(addr);
+            return Ok(Forwardee::Address(addr));
         }
 
         match name {
-            "unknown" => Forwardee::Unkown,
-            "secret" => Forwardee::Secret,
-            name => Forwardee::Named(name.into()),
+            "unknown" => Ok(Forwardee::Unkown),
+            "secret" | "hidden" => Ok(Forwardee::Secret),
+            name if is_rfc7230_token(name) => Ok(Forwardee::Named(name.into())),
+            name => Err(InvalidToken(name.into())),
         }
     }
 }
@@ -978,9 +1029,9 @@ mod tests {
         assert_eq!(format!("{}", forwarded), "for=\"[2001:db8:cafe::17]:4711\"");
 
         let forwarded = Forwarded {
-            r#for: Some("192.0.2.60".into()),
+            r#for: Some("192.0.2.60".parse().unwrap()),
             proto: Some(ForwardProtocol::Http),
-            by: Some("203.0.113.43".into()),
+            by: Some("203.0.113.43".parse().unwrap()),
             ..Default::default()
         };
 
@@ -1027,9 +1078,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             Forwarded {
-                r#for: Some("192.0.2.60".into()),
+                r#for: Some("192.0.2.60".parse().unwrap()),
                 proto: Some(ForwardProtocol::Http),
-                by: Some("203.0.113.43".into()),
+                by: Some("203.0.113.43".parse().unwrap()),
                 ..Default::default()
             },
             forwarded

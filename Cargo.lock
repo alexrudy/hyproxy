@@ -279,6 +279,7 @@ version = "0.1.0"
 dependencies = [
  "http",
  "hyperdriver",
+ "pin-project-lite",
  "thiserror",
  "tokio",
  "tower",
