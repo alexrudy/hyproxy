@@ -125,7 +125,7 @@ impl UpgradeRequest {
         let value = self
             .protocols
             .iter()
-            .map(|p| &p as &str)
+            .map(|p| p as &str)
             .collect::<Vec<&str>>()
             .join(", ");
         HeaderValue::from_str(&value).unwrap()
@@ -149,7 +149,7 @@ impl fmt::Display for UpgradeRequest {
         let value = self
             .protocols
             .iter()
-            .map(|p| &p as &str)
+            .map(|p| p as &str)
             .collect::<Vec<&str>>()
             .join(", ");
         f.write_str(&value)
@@ -172,6 +172,12 @@ impl FromStr for UpgradeRequest {
 #[derive(Clone, Debug)]
 pub struct ProxyUpgradeLayer {
     _priv: (),
+}
+
+impl Default for ProxyUpgradeLayer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProxyUpgradeLayer {
@@ -346,7 +352,7 @@ mod future {
                         });
                     } else {
                         let protocol_options = request_protocol
-                            .map(|p| p.iter().map(|p| &p as &str).collect::<Vec<_>>().join(", "))
+                            .map(|p| p.iter().map(|p| p as &str).collect::<Vec<_>>().join(", "))
                             .unwrap_or_default();
 
                         tracing::debug!(

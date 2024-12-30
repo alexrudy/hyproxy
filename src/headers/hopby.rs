@@ -38,7 +38,7 @@ fn strip_linked_headers(headers: &mut http::HeaderMap, index: http::HeaderName) 
 }
 
 /// Layer to strip hop-by-hop headers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StripHopByHopLayer {
     preserve_connection: bool,
 }
@@ -48,14 +48,6 @@ impl StripHopByHopLayer {
     pub fn new(preserve_connection: bool) -> Self {
         Self {
             preserve_connection,
-        }
-    }
-}
-
-impl Default for StripHopByHopLayer {
-    fn default() -> Self {
-        Self {
-            preserve_connection: false,
         }
     }
 }
