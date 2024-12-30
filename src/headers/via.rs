@@ -8,7 +8,7 @@ use std::{net::SocketAddr, str::FromStr};
 use http::header::HeaderValue;
 use thiserror::Error;
 
-use super::is_rfc7230_token;
+use crate::token::is_rfc7230_token;
 
 /// The `Via` header.
 pub const VIA: http::header::HeaderName = http::header::VIA;
@@ -363,13 +363,13 @@ impl ViaHeaderMode {
 
 /// Middleware to add a Via header to requests and responses.
 #[derive(Debug, Clone)]
-pub struct ViaHeaderLayer {
+pub struct SetViaHeaderLayer {
     address: ViaAddress,
     request: ViaHeaderMode,
     response: ViaHeaderMode,
 }
 
-impl ViaHeaderLayer {
+impl SetViaHeaderLayer {
     /// Create a new Via header layer.
     pub fn new(address: ViaAddress) -> Self {
         Self {
@@ -392,11 +392,11 @@ impl ViaHeaderLayer {
     }
 }
 
-impl<S> tower::layer::Layer<S> for ViaHeaderLayer {
-    type Service = ViaHeaderMiddleware<S>;
+impl<S> tower::layer::Layer<S> for SetViaHeaderLayer {
+    type Service = SetViaHeader<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        ViaHeaderMiddleware {
+        SetViaHeader {
             inner,
             address: self.address.clone(),
             request: self.request,
@@ -407,14 +407,14 @@ impl<S> tower::layer::Layer<S> for ViaHeaderLayer {
 
 /// Middleware to add a Via header to requests and responses.
 #[derive(Debug, Clone)]
-pub struct ViaHeaderMiddleware<S> {
+pub struct SetViaHeader<S> {
     inner: S,
     address: ViaAddress,
     request: ViaHeaderMode,
     response: ViaHeaderMode,
 }
 
-impl<S> ViaHeaderMiddleware<S> {
+impl<S> SetViaHeader<S> {
     /// Create a new Via header middleware.
     pub fn new(inner: S, address: ViaAddress) -> Self {
         Self {
@@ -436,7 +436,7 @@ impl<S> ViaHeaderMiddleware<S> {
     }
 }
 
-impl<S, BIn, BOut> tower::Service<http::Request<BIn>> for ViaHeaderMiddleware<S>
+impl<S, BIn, BOut> tower::Service<http::Request<BIn>> for SetViaHeader<S>
 where
     S: tower::Service<http::Request<BIn>, Response = http::Response<BOut>>,
 {
@@ -669,7 +669,7 @@ mod tests {
 
     #[tokio::test]
     async fn via_header_middleware_defaults() {
-        let middleware = ViaHeaderLayer::new("localhost:8080".parse().unwrap());
+        let middleware = SetViaHeaderLayer::new("localhost:8080".parse().unwrap());
         let service = middleware.layer(tower::service_fn(|req: http::Request<()>| async move {
             let via = Via {
                 protocol: http::Version::HTTP_11.into(),
@@ -701,8 +701,8 @@ mod tests {
 
     #[tokio::test]
     async fn via_header_middleware_append() {
-        let middleware =
-            ViaHeaderLayer::new("localhost:8080".parse().unwrap()).response(ViaHeaderMode::Append);
+        let middleware = SetViaHeaderLayer::new("localhost:8080".parse().unwrap())
+            .response(ViaHeaderMode::Append);
         let service = middleware.layer(tower::service_fn(|req: http::Request<()>| async move {
             let via = Via {
                 protocol: http::Version::HTTP_11.into(),
@@ -736,8 +736,8 @@ mod tests {
 
     #[tokio::test]
     async fn via_header_middleware_replace() {
-        let middleware =
-            ViaHeaderLayer::new("localhost:8080".parse().unwrap()).response(ViaHeaderMode::Replace);
+        let middleware = SetViaHeaderLayer::new("localhost:8080".parse().unwrap())
+            .response(ViaHeaderMode::Replace);
         let service = middleware.layer(tower::service_fn(|req: http::Request<()>| async move {
             let via = Via {
                 protocol: http::Version::HTTP_11.into(),
@@ -766,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn via_header_middleware_omit() {
-        let middleware = ViaHeaderLayer::new("localhost:8080".parse().unwrap())
+        let middleware = SetViaHeaderLayer::new("localhost:8080".parse().unwrap())
             .response(ViaHeaderMode::Omit)
             .request(ViaHeaderMode::Omit);
         let service = middleware.layer(tower::service_fn(|req: http::Request<()>| async move {

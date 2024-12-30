@@ -9,7 +9,7 @@ use std::{
 use hyperdriver::info::ConnectionInfo;
 use thiserror::Error;
 
-use super::is_rfc7230_token;
+use crate::token::is_rfc7230_token;
 
 /// The `Forwarded` header, a standard header for identifying the originating IP address of a client connecting to a web server through a proxy server.
 ///

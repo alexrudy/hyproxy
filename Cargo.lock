@@ -278,6 +278,7 @@ name = "hyproxy"
 version = "0.1.0"
 dependencies = [
  "http",
+ "hyper",
  "hyperdriver",
  "pin-project-lite",
  "thiserror",
