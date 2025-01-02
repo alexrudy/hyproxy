@@ -22,3 +22,4 @@ tower = "0.5.2"
 tokio = { version = "1", features = ["macros"] }
 pin-project-lite = "0.2.15"
 hyper = "1.5.2"
+bytes = "1.9.0"
