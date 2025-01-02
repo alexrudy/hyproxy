@@ -3,6 +3,7 @@
 //! See [RFC-7239](https://datatracker.ietf.org/doc/html/rfc7239)
 //! for the specification of the `Forwarded` header.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{AddrParseError, IpAddr, Ipv6Addr, SocketAddr};
 use std::ops;
@@ -12,6 +13,8 @@ use bytes::Bytes;
 use http::header::InvalidHeaderValue;
 use hyperdriver::info::ConnectionInfo;
 use thiserror::Error;
+
+use crate::token::{FieldValue, InvalidToken, Token};
 
 /// The `Forwarded` header, a standard header for identifying the originating IP address of a client connecting to a web server through a proxy server.
 ///
@@ -46,8 +49,8 @@ impl ForwardingChain {
     /// This should receive the request sent to the proxy server, and will extract the necessary information from it.
     /// It expects that the request has been processed by some middleware that adds the `ConnectionInfo` extension,
     /// which contains the remote and local addresses of the connection.
-    pub fn new<B>(reqeust: &http::Request<B>) -> Self {
-        let forwarded = reqeust.headers().get_all(FORWARDED).iter();
+    pub fn new(headers: &http::HeaderMap) -> Self {
+        let forwarded = headers.get_all(FORWARDED).iter();
         let mut records = if let Some(length) = forwarded.size_hint().1 {
             Vec::with_capacity(length)
         } else {
@@ -171,11 +174,9 @@ impl ForwardedHeader {
     /// Create a new `ForwardedHeader` from a header value.
     pub fn from_header(value: &http::HeaderValue) -> Self {
         let mut records = Vec::new();
-        if let Ok(forwarded) = value.to_str() {
-            for record in forwarded.split(',') {
-                if let Ok(forwarded) = ForwardedRecord::from_str(record) {
-                    records.push(forwarded);
-                }
+        for record in value.as_bytes().split(|c| *c == b',') {
+            if let Ok(forwarded) = ForwardedRecord::try_from(record) {
+                records.push(forwarded);
             }
         }
 
@@ -227,7 +228,7 @@ impl ForwardedHeader {
                 self.iter()
                     .map(|r| r.bytes())
                     .collect::<Vec<_>>()
-                    .join(b",".as_slice())
+                    .join(b", ".as_slice())
                     .try_into()
                     .unwrap(),
             );
@@ -442,6 +443,19 @@ impl From<http::HeaderValue> for ForwardedRecord {
     }
 }
 
+impl TryFrom<&[u8]> for ForwardedRecord {
+    type Error = http::header::InvalidHeaderValue;
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if let Ok(record) = Forwarded::from_header_value(&http::HeaderValue::from_bytes(value)?) {
+            Ok(ForwardedRecord(ForwardedRecordInner::Record(record)))
+        } else {
+            Ok(ForwardedRecord(ForwardedRecordInner::Raw(
+                http::HeaderValue::from_bytes(value)?,
+            )))
+        }
+    }
+}
+
 /// The contents of one record in a `Forwarded` header.
 ///
 /// A forwarded header can consist of multiple comma-separated records, each containing a set of key-value pairs.
@@ -451,6 +465,7 @@ pub struct Forwarded {
     r#for: Option<Forwardee>,
     host: Option<String>,
     proto: Option<ForwardProtocol>,
+    extensions: BTreeMap<Token, FieldValue>,
 }
 
 impl Forwarded {
@@ -490,6 +505,7 @@ impl Forwarded {
             r#for,
             host,
             proto,
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -529,6 +545,16 @@ impl Forwarded {
     /// The `proto` field of the `Forwarded` header, which identifies the protocol used by the client to connect to the proxy.
     pub fn proto(&self) -> Option<&ForwardProtocol> {
         self.proto.as_ref()
+    }
+
+    /// The extensions in the `Forwarded` header.
+    pub fn extensions(&self) -> &BTreeMap<Token, FieldValue> {
+        &self.extensions
+    }
+
+    /// Mutable reference to the extensions in the `Forwarded` header.
+    pub fn extensions_mut(&mut self) -> &mut BTreeMap<Token, FieldValue> {
+        &mut self.extensions
     }
 
     /// Remove the `by` field from the `Forwarded` header.
@@ -602,7 +628,11 @@ impl fmt::Display for Forwarded {
             parts.push(format!("proto={}", proto));
         }
 
-        write!(f, "{}", parts.join(";"))
+        for (key, value) in &self.extensions {
+            parts.push(format!("{}={}", key, value));
+        }
+
+        write!(f, "{}", parts.join("; "))
     }
 }
 
@@ -621,6 +651,7 @@ impl FromStr for Forwarded {
         let mut r#for = None;
         let mut host = None;
         let mut proto = None;
+        let mut extensions = BTreeMap::new();
 
         for part in s.split(';') {
             let (key, value) = part.split_once('=').ok_or_else(|| ParseForwardedError {
@@ -649,7 +680,7 @@ impl FromStr for Forwarded {
                 "by" => insert_or_error(
                     &mut by,
                     value.parse().map_err(|error| ParseForwardedError {
-                        kind: ParseForwadingErrorKind::InvalidToken {
+                        kind: ParseForwadingErrorKind::InvalidNodeName {
                             key: key.to_string(),
                             error,
                         },
@@ -659,7 +690,7 @@ impl FromStr for Forwarded {
                 "for" => insert_or_error(
                     &mut r#for,
                     value.parse().map_err(|error| ParseForwardedError {
-                        kind: ParseForwadingErrorKind::InvalidToken {
+                        kind: ParseForwadingErrorKind::InvalidNodeName {
                             key: key.to_string(),
                             error,
                         },
@@ -686,10 +717,18 @@ impl FromStr for Forwarded {
                     })?;
                     insert_or_error(&mut proto, value, key)?
                 }
-                _ => {
-                    return Err(ParseForwardedError {
-                        kind: ParseForwadingErrorKind::InvalidKey(key.to_string()),
-                    })
+                key => {
+                    extensions.insert(
+                        key.parse().map_err(|_| ParseForwardedError {
+                            kind: ParseForwadingErrorKind::InvalidKey(key.into()),
+                        })?,
+                        value.parse().map_err(|error| ParseForwardedError {
+                            kind: ParseForwadingErrorKind::InvalidToken {
+                                key: key.to_string(),
+                                error,
+                            },
+                        })?,
+                    );
                 }
             }
         }
@@ -699,6 +738,7 @@ impl FromStr for Forwarded {
             r#for,
             host,
             proto,
+            extensions,
         })
     }
 }
@@ -713,6 +753,13 @@ enum ParseForwadingErrorKind {
 
     #[error("invalid key for FORWARDED: {0}")]
     InvalidKey(String),
+
+    #[error("invalid characters in node name for FORWARDED ({key}): {error}")]
+    InvalidNodeName {
+        key: String,
+        #[source]
+        error: InvalidNameToken,
+    },
 
     #[error("invalid characters in token for FORWARDED ({key}): {error}")]
     InvalidToken {
@@ -797,7 +844,7 @@ impl From<SocketAddr> for Forwardee {
 /// Error indicating that a chacracter in a token is not valid.
 #[derive(Debug, Error)]
 #[error("invalid token: {0}")]
-pub struct InvalidToken(String);
+pub struct InvalidNameToken(String);
 
 const FORWARDED_NAME_TOKENS: [char; 3] = ['.', '_', '-'];
 
@@ -809,7 +856,7 @@ fn is_forwarded_name(value: &str) -> bool {
 }
 
 impl FromStr for Forwardee {
-    type Err = InvalidToken;
+    type Err = InvalidNameToken;
 
     fn from_str(name: &str) -> Result<Self, Self::Err> {
         if let Ok(addr) = name.parse::<ForwardAddress>() {
@@ -821,7 +868,7 @@ impl FromStr for Forwardee {
             name if is_forwarded_name(name) => {
                 Ok(Forwardee::Named(name.strip_prefix('_').unwrap().into()))
             }
-            name => Err(InvalidToken(name.into())),
+            name => Err(InvalidNameToken(name.into())),
         }
     }
 }
@@ -1215,6 +1262,53 @@ impl<S> SetForwardedHeader<S> {
         self.config = config;
         self
     }
+
+    /// Apply the `Forwarded` header configuration to a request.
+    pub fn set_forwarded_header<B>(&self, req: &mut http::Request<B>) {
+        let forward = self.config.from_request(req);
+
+        if self.set_x_headers {
+            forward.set_x_forwarded_headers(req);
+        }
+
+        match self.append {
+            ForwardedHeaderAppend::Chain => {
+                let mut chain = ForwardingChain::new(req.headers());
+                chain.push_record(forward);
+                req.headers_mut().remove(FORWARDED);
+                chain.set_all_forwarded_headers(req);
+            }
+            ForwardedHeaderAppend::Flatten => {
+                let mut chain = ForwardingChain::new(req.headers());
+                chain.push_header(forward);
+                req.headers_mut().remove(FORWARDED);
+                chain.set_single_forwarded_header(req);
+            }
+            ForwardedHeaderAppend::Expand => {
+                let mut chain = ForwardingChain::new(req.headers());
+                chain.push_header(forward);
+                req.headers_mut().remove(FORWARDED);
+                for record in chain.flat_iter() {
+                    record.set_header(req);
+                }
+            }
+            ForwardedHeaderAppend::Replace => {
+                req.headers_mut().remove(FORWARDED);
+                forward.set_header(req);
+            }
+            ForwardedHeaderAppend::Append => {
+                forward.set_header(req);
+            }
+            ForwardedHeaderAppend::KeepFirst => {
+                let mut chain = ForwardingChain::new(req.headers());
+                chain.push_header(forward);
+                if let Some(record) = chain.first() {
+                    req.headers_mut().remove(FORWARDED);
+                    record.set_header(req)
+                };
+            }
+        }
+    }
 }
 
 impl<S, B> tower::Service<http::Request<B>> for SetForwardedHeader<S>
@@ -1233,46 +1327,7 @@ where
     }
 
     fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
-        let forward = self.config.from_request(&req);
-
-        if self.set_x_headers {
-            forward.set_x_forwarded_headers(&mut req);
-        }
-
-        match self.append {
-            ForwardedHeaderAppend::Chain => {
-                let mut chain = ForwardingChain::new(&req);
-                chain.push_header(forward);
-                chain.set_all_forwarded_headers(&mut req);
-            }
-            ForwardedHeaderAppend::Flatten => {
-                let mut chain = ForwardingChain::new(&req);
-                chain.push_header(forward);
-                chain.set_single_forwarded_header(&mut req);
-            }
-            ForwardedHeaderAppend::Expand => {
-                let mut chain = ForwardingChain::new(&req);
-                chain.push_header(forward);
-                for record in chain.flat_iter() {
-                    record.set_header(&mut req);
-                }
-            }
-            ForwardedHeaderAppend::Replace => {
-                req.headers_mut().remove(FORWARDED);
-                forward.set_header(&mut req);
-            }
-            ForwardedHeaderAppend::Append => {
-                forward.set_header(&mut req);
-            }
-            ForwardedHeaderAppend::KeepFirst => {
-                let mut chain = ForwardingChain::new(&req);
-                chain.push_header(forward);
-                if let Some(record) = chain.first() {
-                    record.set_header(&mut req)
-                };
-            }
-        }
-
+        self.set_forwarded_header(&mut req);
         self.inner.call(req)
     }
 }
@@ -1428,13 +1483,13 @@ mod tests {
 
         assert_eq!(
             format!("{}", forwarded),
-            "by=203.0.113.43;for=192.0.2.60;proto=http"
+            "by=203.0.113.43; for=192.0.2.60; proto=http"
         );
     }
 
     #[test]
     fn parse_forwarded_record() {
-        let forwarded = "for=192.0.2.60;proto=https"
+        let forwarded = "for=192.0.2.60; proto=https"
             .parse::<ForwardedRecord>()
             .unwrap();
 
@@ -1477,7 +1532,7 @@ mod tests {
             .headers_mut()
             .append(FORWARDED, "for=192.0.2.5".parse().unwrap());
 
-        let chain = ForwardingChain::new(&request);
+        let chain = ForwardingChain::new(request.headers());
         assert_eq!(chain.len(), 2);
 
         let mut iter = chain.into_flat_iter();
@@ -1649,7 +1704,7 @@ mod tests {
 
         let response = service.oneshot(request).await.unwrap();
         let forwarded = response.headers().get(FORWARDED).unwrap();
-        assert_eq!(forwarded, "for=unknown;host=example.com;proto=http");
+        assert_eq!(forwarded, "for=unknown; host=example.com; proto=http");
     }
 
     #[tokio::test]
@@ -1681,7 +1736,10 @@ mod tests {
 
             let response = service.oneshot(request).await.unwrap();
             let forwarded = response.headers().get(FORWARDED).unwrap();
-            assert_eq!(forwarded, "for=\"[::1]:8080\";host=example.com;proto=https");
+            assert_eq!(
+                forwarded,
+                "for=\"[::1]:8080\"; host=example.com; proto=https"
+            );
         }
     }
 
@@ -1706,7 +1764,10 @@ mod tests {
 
         let response = service.oneshot(request).await.unwrap();
         let forwarded = response.headers().get(FORWARDED).unwrap();
-        assert_eq!(forwarded, "for=\"[::1]:8080\";host=example.com;proto=http");
+        assert_eq!(
+            forwarded,
+            "for=\"[::1]:8080\"; host=example.com; proto=http"
+        );
 
         let x_forwarded_for = response
             .headers()
@@ -1748,7 +1809,10 @@ mod tests {
 
         let response = service.oneshot(request).await.unwrap();
         let forwarded = response.headers().get(FORWARDED).unwrap();
-        assert_eq!(forwarded, "for=_example-proxy;host=example.com;proto=http");
+        assert_eq!(
+            forwarded,
+            "for=_example-proxy; host=example.com; proto=http"
+        );
 
         assert!(
             response.headers().get(X_FORWARDED_FOR).is_none(),
@@ -1793,7 +1857,7 @@ mod tests {
         assert_eq!(
             forwarded,
             http::HeaderValue::from_bytes(
-                b"not-a-valid value\xaf, for=192.0.2.5; proto=https, host=example.com; proto=http"
+                b"not-a-valid value\xaf, for=192.0.2.5; proto=https, for=unknown; host=example.com; proto=http"
             )
             .unwrap()
         );
@@ -1824,9 +1888,9 @@ mod tests {
 
         let response = service.oneshot(request).await.unwrap();
         let headers = response.headers().get_all(FORWARDED);
-        assert_eq!(headers.iter().count(), 3);
+        assert_eq!(headers.iter().count(), 2);
 
-        let chain = ForwardingChain::new(&response);
+        let chain = ForwardingChain::new(response.headers());
         assert_eq!(chain.len(), 2);
         assert_eq!(chain.flat_iter().count(), 3);
 
@@ -1883,7 +1947,7 @@ mod tests {
         let headers = response.headers().get_all(FORWARDED);
         assert_eq!(headers.iter().count(), 1);
 
-        let chain = ForwardingChain::new(&response);
+        let chain = ForwardingChain::new(response.headers());
         assert_eq!(chain.len(), 1);
         assert_eq!(chain.flat_iter().count(), 1);
 
@@ -1894,7 +1958,6 @@ mod tests {
                 r#for: Some(Forwardee::Address("192.0.2.4".parse().unwrap())),
                 ..Default::default()
             }
-            .into()
         );
     }
 }
