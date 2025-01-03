@@ -6,15 +6,17 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{AddrParseError, IpAddr, Ipv6Addr, SocketAddr};
-use std::ops;
 use std::str::FromStr;
 
-use bytes::Bytes;
-use http::header::InvalidHeaderValue;
 use hyperdriver::info::ConnectionInfo;
 use thiserror::Error;
 
 use crate::token::{FieldValue, InvalidToken, Token};
+
+use super::chain::{
+    AppendHeaderRecordMode, FromRequest, Header, HeaderChain, ParseChainRecord, Record,
+    ToChainRecord,
+};
 
 /// The `Forwarded` header, a standard header for identifying the originating IP address of a client connecting to a web server through a proxy server.
 ///
@@ -38,32 +40,9 @@ pub const X_FORWARDED_PROTO: http::HeaderName =
 ///
 /// The FORWARDED header can contain multiple comma-separated values, or multiple FORWARDED headers
 /// can be present - to parse a requests full chain requires parsing all headers.
-#[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
-pub struct ForwardingChain {
-    records: Vec<ForwardedHeader>,
-}
+pub type ForwardingChain = HeaderChain<Forwarded>;
 
 impl ForwardingChain {
-    /// Create a new `ForwardingChain` from a request.
-    ///
-    /// This should receive the request sent to the proxy server, and will extract the necessary information from it.
-    /// It expects that the request has been processed by some middleware that adds the `ConnectionInfo` extension,
-    /// which contains the remote and local addresses of the connection.
-    pub fn new(headers: &http::HeaderMap) -> Self {
-        let forwarded = headers.get_all(FORWARDED).iter();
-        let mut records = if let Some(length) = forwarded.size_hint().1 {
-            Vec::with_capacity(length)
-        } else {
-            Vec::new()
-        };
-        for value in forwarded {
-            let header = ForwardedHeader::from_header(value);
-            records.push(header);
-        }
-
-        Self { records }
-    }
-
     /// Check if any of the fields are set.
     ///
     /// When no fields are set, the `Forwarded` header should not be included in the request.
@@ -71,26 +50,9 @@ impl ForwardingChain {
         self.flat_iter().any(ForwardedRecord::any)
     }
 
-    /// Create an iterator over the `Forwarded` headers.
-    pub fn iter(&self) -> impl Iterator<Item = &ForwardedHeader> {
-        self.records.iter()
-    }
-
-    /// Create an iterator over the `Forwarded` header records from all headers.
-    pub fn flat_iter(&self) -> impl Iterator<Item = &ForwardedRecord> {
-        self.records.iter().flat_map(ForwardedHeader::records)
-    }
-
-    /// Create an IntoIterator over the `Forwarded` header records from all headers.
-    pub fn into_flat_iter(self) -> impl Iterator<Item = ForwardedRecord> {
-        self.records.into_iter().flat_map(|h| h.records.into_iter())
-    }
-
     /// Remove the `by` field from the `Forwarded` header.
     pub fn without_by(self) -> Self {
-        Self {
-            records: self.into_iter().map(ForwardedHeader::without_by).collect(),
-        }
+        self.into_iter().map(ForwardedHeader::without_by).collect()
     }
 
     /// Set the `X-Forwarded-*` headers on a request.
@@ -98,59 +60,6 @@ impl ForwardingChain {
         for record in self.flat_iter() {
             record.set_x_forwarded_headers(request);
         }
-    }
-
-    /// Set the `Forwarded` header on a request.
-    pub fn set_single_forwarded_header<B>(&self, request: &mut http::Request<B>) {
-        if self.any() {
-            request.headers_mut().append(
-                FORWARDED,
-                self.flat_iter()
-                    .map(|r| r.bytes())
-                    .collect::<Vec<_>>()
-                    .join(b",".as_slice())
-                    .try_into()
-                    .unwrap(),
-            );
-        }
-    }
-
-    /// Set a sequence of `Forwarded` headers on a request.
-    pub fn set_all_forwarded_headers<B>(&self, request: &mut http::Request<B>) {
-        for record in &self.records {
-            record.set_header(request);
-        }
-    }
-
-    /// Add a record to the `Forwarded` header.
-    pub fn push_record(&mut self, record: impl Into<Forwarded>) {
-        if let Some(entry) = self.records.last_mut() {
-            entry.push(record.into());
-        } else {
-            self.records.push(ForwardedHeader::from(record.into()));
-        }
-    }
-
-    /// Add a header to the `Forwarded` header.
-    pub fn push_header(&mut self, header: impl Into<ForwardedHeader>) {
-        self.records.push(header.into());
-    }
-}
-
-impl IntoIterator for ForwardingChain {
-    type Item = ForwardedHeader;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.records.into_iter()
-    }
-}
-
-impl ops::Deref for ForwardingChain {
-    type Target = [ForwardedHeader];
-
-    fn deref(&self) -> &Self::Target {
-        &self.records
     }
 }
 
@@ -160,116 +69,30 @@ impl ops::Deref for ForwardingChain {
 ///
 /// This holds `ForwardedRecord` values, which can be parsed or raw, to enable losslessly
 /// preserving original values which don't parse as records.
-#[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
-pub struct ForwardedHeader {
-    records: Vec<ForwardedRecord>,
-}
+pub type ForwardedHeader = Header<Forwarded>;
 
 impl ForwardedHeader {
-    /// Create a new `ForwardedHeader` with no records.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Create a new `ForwardedHeader` from a header value.
-    pub fn from_header(value: &http::HeaderValue) -> Self {
-        let mut records = Vec::new();
-        for record in value.as_bytes().split(|c| *c == b',') {
-            if let Ok(forwarded) = ForwardedRecord::try_from(record) {
-                records.push(forwarded);
-            }
-        }
-
-        Self { records }
-    }
-
     /// Check if any of the fields are set.
     ///
     /// If any raw values are present, and not empty,
     /// this will return `true`.
     pub fn any(&self) -> bool {
-        self.records.iter().any(ForwardedRecord::any)
-    }
-
-    /// The records in the `Forwarded` header.
-    pub fn records(&self) -> &[ForwardedRecord] {
-        &self.records
+        self.iter().any(ForwardedRecord::any)
     }
 
     /// Remove the `by` field from the parsed `Forwarded` header.
     ///
     /// Leaves the raw values unchanged.
     pub fn without_by(self) -> Self {
-        Self {
-            records: self
-                .records
-                .into_iter()
-                .map(ForwardedRecord::without_by)
-                .collect(),
-        }
+        self.into_iter().map(ForwardedRecord::without_by).collect()
     }
 
     /// Set the `X-Forwarded-*` headers on a request.
     ///
     /// This will skip unparsed raw values.
     pub fn set_all_x_forwarded_headers<B>(&self, request: &mut http::Request<B>) {
-        for record in &self.records {
+        for record in self.iter() {
             record.set_x_forwarded_headers(request);
-        }
-    }
-
-    /// Set the `Forwarded` header on a request.
-    ///
-    /// This will include all raw values.
-    pub fn set_header<B>(&self, request: &mut http::Request<B>) {
-        if self.any() {
-            request.headers_mut().append(
-                FORWARDED,
-                self.iter()
-                    .map(|r| r.bytes())
-                    .collect::<Vec<_>>()
-                    .join(b", ".as_slice())
-                    .try_into()
-                    .unwrap(),
-            );
-        }
-    }
-
-    /// Add a record to the `Forwarded` header.
-    pub fn push(&mut self, record: impl Into<ForwardedRecord>) {
-        self.records.push(record.into());
-    }
-}
-
-impl IntoIterator for ForwardedHeader {
-    type Item = ForwardedRecord;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.records.into_iter()
-    }
-}
-
-impl ops::Deref for ForwardedHeader {
-    type Target = [ForwardedRecord];
-
-    fn deref(&self) -> &Self::Target {
-        &self.records
-    }
-}
-
-impl From<Forwarded> for ForwardedHeader {
-    fn from(forwarded: Forwarded) -> Self {
-        Self {
-            records: vec![forwarded.into()],
-        }
-    }
-}
-
-impl From<ForwardedRecord> for ForwardedHeader {
-    fn from(record: ForwardedRecord) -> Self {
-        Self {
-            records: vec![record],
         }
     }
 }
@@ -278,180 +101,32 @@ impl From<ForwardedRecord> for ForwardedHeader {
 ///
 /// This can be a parsed `Forwarded` record, or a raw string that could not be parsed,
 /// so that the original value can be preserved.
-#[derive(Clone, Eq, PartialEq, Hash)]
-pub struct ForwardedRecord(ForwardedRecordInner);
-
-impl fmt::Debug for ForwardedRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            ForwardedRecordInner::Record(record) => f
-                .debug_tuple("ForwardedRecord::Record")
-                .field(record)
-                .finish(),
-            ForwardedRecordInner::Raw(raw) => {
-                f.debug_tuple("ForwardedRecord::Raw").field(raw).finish()
-            }
-        }
-    }
-}
+pub type ForwardedRecord = Record<Forwarded>;
 
 impl ForwardedRecord {
-    /// The `Forwarded` record.
-    pub fn record(&self) -> Option<&Forwarded> {
-        match &self.0 {
-            ForwardedRecordInner::Record(record) => Some(record),
-            _ => None,
-        }
-    }
-
-    /// The parsed value of the `Forwarded` record.
-    pub fn into_record(self) -> Option<Forwarded> {
-        match self.0 {
-            ForwardedRecordInner::Record(record) => Some(record),
-            _ => None,
-        }
-    }
-
-    /// The raw value of the `Forwarded` record as `Bytes`.
-    pub fn bytes(&self) -> Bytes {
-        match &self.0 {
-            ForwardedRecordInner::Record(record) => Bytes::from(record.to_string()),
-            ForwardedRecordInner::Raw(raw) => Bytes::copy_from_slice(raw.as_bytes()),
-        }
-    }
-
-    /// The value of the `Forwarded` record.
-    ///
-    /// For parsed values, this will convert to a `http::HeaderValue`.
-    pub fn into_header_value(self) -> http::HeaderValue {
-        match self.0 {
-            ForwardedRecordInner::Raw(raw) => raw,
-            ForwardedRecordInner::Record(record) => record.to_header_value(),
-        }
-    }
-
-    /// The raw value of the `Forwarded` record.
-    pub fn into_raw(self) -> Option<http::HeaderValue> {
-        match self.0 {
-            ForwardedRecordInner::Raw(raw) => Some(raw),
-            _ => None,
-        }
-    }
-
-    /// Check if the `Forwarded` record is raw or parsed.
-    pub fn is_raw(&self) -> bool {
-        matches!(self.0, ForwardedRecordInner::Raw(_))
-    }
-
-    /// The raw value of the `Forwarded` record.
-    pub fn raw(&self) -> Option<&http::HeaderValue> {
-        match &self.0 {
-            ForwardedRecordInner::Raw(raw) => Some(raw),
-            _ => None,
-        }
-    }
-
     /// Check if any of the fields are set.
     ///
     /// If the record is raw, this will return `true` if the value is not empty.
     pub fn any(&self) -> bool {
-        match &self.0 {
-            ForwardedRecordInner::Record(record) => record.any(),
-            ForwardedRecordInner::Raw(raw) => !raw.is_empty(),
-        }
+        self.value()
+            .map(|v| v.any())
+            .or_else(|| self.raw().map(|bytes| bytes.is_empty()))
+            .unwrap()
     }
 
     /// Remove the `by` field from the `Forwarded` record.
     ///
     /// If the record is raw, this will return a new raw record with the same value.
     pub fn without_by(self) -> Self {
-        match self.0 {
-            ForwardedRecordInner::Record(record) => {
-                ForwardedRecord(ForwardedRecordInner::Record(record.without_by()))
-            }
-            ForwardedRecordInner::Raw(raw) => ForwardedRecord(ForwardedRecordInner::Raw(raw)),
-        }
+        self.map(Forwarded::without_by)
     }
 
     /// Set the `X-Forwarded-*` headers on a request.
     ///
     /// If the record is raw, this will do nothing.
     pub fn set_x_forwarded_headers<B>(&self, request: &mut http::Request<B>) {
-        match &self.0 {
-            ForwardedRecordInner::Record(record) => record.set_x_forwarded_headers(request),
-            ForwardedRecordInner::Raw(_) => {}
-        }
-    }
-
-    /// Set the `Forwarded` header on a request.
-    pub fn set_header<B>(&self, request: &mut http::Request<B>) {
-        match &self.0 {
-            ForwardedRecordInner::Record(record) => record.set_header(request),
-            ForwardedRecordInner::Raw(value) => {
-                request.headers_mut().append(FORWARDED, value.clone());
-            }
-        }
-    }
-}
-
-impl fmt::Display for ForwardedRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            ForwardedRecordInner::Record(record) => write!(f, "{}", record),
-            ForwardedRecordInner::Raw(raw) => {
-                if let Ok(s) = raw.to_str() {
-                    write!(f, "{}", s)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-enum ForwardedRecordInner {
-    Record(Forwarded),
-    Raw(http::HeaderValue),
-}
-
-impl From<Forwarded> for ForwardedRecord {
-    fn from(record: Forwarded) -> Self {
-        ForwardedRecord(ForwardedRecordInner::Record(record))
-    }
-}
-
-impl FromStr for ForwardedRecord {
-    type Err = InvalidHeaderValue;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match Forwarded::from_str(s) {
-            Ok(record) => Ok(ForwardedRecord(ForwardedRecordInner::Record(record))),
-            Err(_) => http::HeaderValue::from_str(s)
-                .map(|v| ForwardedRecord(ForwardedRecordInner::Raw(v))),
-        }
-    }
-}
-
-impl From<http::HeaderValue> for ForwardedRecord {
-    fn from(value: http::HeaderValue) -> Self {
-        if let Ok(record) = Forwarded::from_header_value(&value) {
-            ForwardedRecord(ForwardedRecordInner::Record(record))
-        } else {
-            ForwardedRecord(ForwardedRecordInner::Raw(value))
-        }
-    }
-}
-
-impl TryFrom<&[u8]> for ForwardedRecord {
-    type Error = http::header::InvalidHeaderValue;
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if let Ok(record) = Forwarded::from_header_value(&http::HeaderValue::from_bytes(value)?) {
-            Ok(ForwardedRecord(ForwardedRecordInner::Record(record)))
-        } else {
-            Ok(ForwardedRecord(ForwardedRecordInner::Raw(
-                http::HeaderValue::from_bytes(value)?,
-            )))
+        if let Some(record) = self.value() {
+            record.set_x_forwarded_headers(request);
         }
     }
 }
@@ -474,13 +149,13 @@ impl Forwarded {
     /// This should receive the request sent to the proxy server, and will extract the necessary information from it.
     /// It expects that the request has been processed by some middleware that adds the `ConnectionInfo` extension,
     /// which contains the remote and local addresses of the connection.
-    pub fn new<B>(reqeust: &http::Request<B>) -> Self {
+    pub fn new<B>(request: &http::Request<B>) -> Self {
         let mut by = None;
         let mut r#for = None;
         let mut host = None;
         let mut proto = None;
 
-        if let Some(info) = reqeust.extensions().get::<ConnectionInfo>() {
+        if let Some(info) = request.extensions().get::<ConnectionInfo>() {
             if let Some(remote) = info.remote_addr.clone().canonical().tcp() {
                 r#for = Some(Forwardee::Address(remote.into()));
             }
@@ -492,11 +167,11 @@ impl Forwarded {
             tracing::warn!("No connection info found in request extensions");
         }
 
-        if let Some(header) = reqeust.headers().get(http::header::HOST) {
+        if let Some(header) = request.headers().get(http::header::HOST) {
             host = header.to_str().ok().map(|s| s.to_string());
         }
 
-        if let Some(scheme) = reqeust.uri().scheme() {
+        if let Some(scheme) = request.uri().scheme() {
             proto = scheme.try_into().ok();
         }
 
@@ -636,10 +311,30 @@ impl fmt::Display for Forwarded {
     }
 }
 
-impl From<Forwarded> for http::HeaderValue {
-    fn from(forwarded: Forwarded) -> Self {
-        let value = format!("{}", forwarded);
-        http::HeaderValue::from_str(&value).unwrap()
+impl ToChainRecord for Forwarded {
+    const HEADER_NAME: http::HeaderName = FORWARDED;
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.to_string().into_bytes()
+    }
+}
+
+impl ParseChainRecord for Forwarded {
+    const DELIMITER: u8 = b',';
+
+    type Error = ParseForwardedError;
+
+    fn parse_record(value: &[u8]) -> Result<Self, Self::Error>
+    where
+        Self: Sized,
+    {
+        std::str::from_utf8(value)?.parse()
+    }
+}
+
+impl FromRequest for Forwarded {
+    fn from_request<B>(request: &http::Request<B>) -> Self {
+        Self::new(request)
     }
 }
 
@@ -786,6 +481,12 @@ enum ParseForwadingErrorKind {
         source: http::header::ToStrError,
         header: http::header::HeaderValue,
     },
+
+    #[error("invalid characters for FORWARDED: {error}")]
+    InvalidCharacters {
+        #[from]
+        error: std::str::Utf8Error,
+    },
 }
 
 /// An error parsing a `Forwarded` header record.
@@ -793,6 +494,17 @@ enum ParseForwadingErrorKind {
 #[error("{}", .kind)]
 pub struct ParseForwardedError {
     kind: ParseForwadingErrorKind,
+}
+
+impl<T> From<T> for ParseForwardedError
+where
+    ParseForwadingErrorKind: From<T>,
+{
+    fn from(source: T) -> Self {
+        ParseForwardedError {
+            kind: source.into(),
+        }
+    }
 }
 
 /// An interface used in a `Forwarded` header chain.
@@ -1208,37 +920,13 @@ impl ForwardedHeaderConfig {
     }
 }
 
-/// How to handle existing `Forwarded` headers
-/// when adding a new `Forwarded` header.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub enum ForwardedHeaderAppend {
-    /// Chain the new record onto the last FORWARDED header (via comma-separated values)
-    Chain,
-
-    /// Flatten all records into a single FORWARDED header (via comma-separated values)
-    Flatten,
-
-    /// Expand all records into separate FORWARDED headers
-    Expand,
-
-    /// Replace any existing FORWARDED headers with the new record
-    Replace,
-
-    /// Apppend a new FORWARDED header to the existing headers
-    #[default]
-    Append,
-
-    /// Keep the first FORWARDED header and ignore the new record if a record already exists
-    KeepFirst,
-}
-
 /// A middleware for adding a `Forwarded` header to requests.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct SetForwardedHeader<S> {
     inner: S,
     config: ForwardedHeaderConfig,
     set_x_headers: bool,
-    append: ForwardedHeaderAppend,
+    append: AppendHeaderRecordMode,
 }
 
 impl<S> SetForwardedHeader<S> {
@@ -1247,7 +935,7 @@ impl<S> SetForwardedHeader<S> {
         inner: S,
         config: ForwardedHeaderConfig,
         set_x_headers: bool,
-        append: ForwardedHeaderAppend,
+        append: AppendHeaderRecordMode,
     ) -> Self {
         Self {
             inner,
@@ -1271,43 +959,7 @@ impl<S> SetForwardedHeader<S> {
             forward.set_x_forwarded_headers(req);
         }
 
-        match self.append {
-            ForwardedHeaderAppend::Chain => {
-                let mut chain = ForwardingChain::new(req.headers());
-                chain.push_record(forward);
-                req.headers_mut().remove(FORWARDED);
-                chain.set_all_forwarded_headers(req);
-            }
-            ForwardedHeaderAppend::Flatten => {
-                let mut chain = ForwardingChain::new(req.headers());
-                chain.push_header(forward);
-                req.headers_mut().remove(FORWARDED);
-                chain.set_single_forwarded_header(req);
-            }
-            ForwardedHeaderAppend::Expand => {
-                let mut chain = ForwardingChain::new(req.headers());
-                chain.push_header(forward);
-                req.headers_mut().remove(FORWARDED);
-                for record in chain.flat_iter() {
-                    record.set_header(req);
-                }
-            }
-            ForwardedHeaderAppend::Replace => {
-                req.headers_mut().remove(FORWARDED);
-                forward.set_header(req);
-            }
-            ForwardedHeaderAppend::Append => {
-                forward.set_header(req);
-            }
-            ForwardedHeaderAppend::KeepFirst => {
-                let mut chain = ForwardingChain::new(req.headers());
-                chain.push_header(forward);
-                if let Some(record) = chain.first() {
-                    req.headers_mut().remove(FORWARDED);
-                    record.set_header(req)
-                };
-            }
-        }
+        ForwardingChain::append_record(&self.append, forward, req.headers_mut());
     }
 }
 
@@ -1337,7 +989,7 @@ where
 pub struct SetForwardedHeaderLayer {
     config: ForwardedHeaderConfig,
     set_x_headers: bool,
-    append: ForwardedHeaderAppend,
+    append: AppendHeaderRecordMode,
 }
 
 impl Default for SetForwardedHeaderLayer {
@@ -1346,7 +998,7 @@ impl Default for SetForwardedHeaderLayer {
         Self {
             config: ForwardedHeaderConfig::default(),
             set_x_headers: false,
-            append: ForwardedHeaderAppend::Append,
+            append: AppendHeaderRecordMode::default(),
         }
     }
 }
@@ -1357,7 +1009,7 @@ impl SetForwardedHeaderLayer {
         Self {
             config: ForwardedHeaderConfig::default(),
             set_x_headers: false,
-            append: ForwardedHeaderAppend::Append,
+            append: AppendHeaderRecordMode::default(),
         }
     }
 
@@ -1374,7 +1026,7 @@ impl SetForwardedHeaderLayer {
     }
 
     /// Set wether to collect the `Forwarded` headers into a chain.
-    pub fn append_forwarded_headers(mut self, append: ForwardedHeaderAppend) -> Self {
+    pub fn append_forwarded_headers(mut self, append: AppendHeaderRecordMode) -> Self {
         self.append = append;
         self
     }
@@ -1399,6 +1051,8 @@ mod tests {
 
     use hyperdriver::info::BraidAddr;
     use tower::ServiceExt;
+
+    use crate::headers::chain::ChainRecord as _;
 
     use super::*;
 
@@ -1532,13 +1186,13 @@ mod tests {
             .headers_mut()
             .append(FORWARDED, "for=192.0.2.5".parse().unwrap());
 
-        let chain = ForwardingChain::new(request.headers());
+        let chain = Forwarded::chain_from_headers(request.headers());
         assert_eq!(chain.len(), 2);
 
-        let mut iter = chain.into_flat_iter();
+        let mut iter = chain.flat_into_iter();
 
         assert_eq!(
-            iter.next().unwrap().into_record().unwrap(),
+            iter.next().unwrap().into_value().unwrap(),
             Forwarded {
                 r#for: Some(Forwardee::Address("192.0.2.1".parse().unwrap())),
                 ..Default::default()
@@ -1546,7 +1200,7 @@ mod tests {
         );
 
         assert_eq!(
-            iter.next().unwrap().into_record().unwrap(),
+            iter.next().unwrap().into_value().unwrap(),
             Forwarded {
                 r#for: Some(Forwardee::Address(
                     "[2001:db8:cafe::18]:8080".parse().unwrap()
@@ -1557,7 +1211,7 @@ mod tests {
         );
 
         assert_eq!(
-            iter.next().unwrap().into_record().unwrap(),
+            iter.next().unwrap().into_value().unwrap(),
             Forwarded {
                 r#for: Some(Forwardee::Address("192.0.2.5".parse().unwrap())),
                 ..Default::default()
@@ -1710,12 +1364,11 @@ mod tests {
     #[tokio::test]
     async fn forwarded_header_service_ipv6() {
         for mode in [
-            ForwardedHeaderAppend::Append,
-            ForwardedHeaderAppend::Chain,
-            ForwardedHeaderAppend::Expand,
-            ForwardedHeaderAppend::Replace,
-            ForwardedHeaderAppend::Append,
-            ForwardedHeaderAppend::KeepFirst,
+            AppendHeaderRecordMode::Append,
+            AppendHeaderRecordMode::Chain,
+            AppendHeaderRecordMode::Expand,
+            AppendHeaderRecordMode::KeepFirst,
+            AppendHeaderRecordMode::KeepLast,
         ] {
             let service = SetForwardedHeader::new(
                 tower::service_fn(|req: http::Request<()>| async { Ok::<_, ()>(req) }),
@@ -1749,7 +1402,7 @@ mod tests {
             tower::service_fn(|req: http::Request<()>| async { Ok::<_, ()>(req) }),
             Default::default(),
             true,
-            ForwardedHeaderAppend::Replace,
+            AppendHeaderRecordMode::KeepLast,
         )
         .config(ForwardedHeaderConfig {
             r#for: ForwardeeMode::Address,
@@ -1838,7 +1491,7 @@ mod tests {
             tower::service_fn(|req: http::Request<()>| async { Ok::<_, ()>(req) }),
             Default::default(),
             false,
-            ForwardedHeaderAppend::Chain,
+            AppendHeaderRecordMode::Chain,
         );
 
         let mut request = http::Request::get("http://example.com").body(()).unwrap();
@@ -1854,6 +1507,7 @@ mod tests {
 
         let response = service.oneshot(request).await.unwrap();
         let forwarded = response.headers().get(FORWARDED).unwrap();
+
         assert_eq!(
             forwarded,
             http::HeaderValue::from_bytes(
@@ -1869,7 +1523,7 @@ mod tests {
             tower::service_fn(|req: http::Request<()>| async { Ok::<_, ()>(req) }),
             Default::default(),
             false,
-            ForwardedHeaderAppend::Append,
+            AppendHeaderRecordMode::Append,
         );
 
         let mut request = http::Request::get("http://example.com").body(()).unwrap();
@@ -1890,13 +1544,13 @@ mod tests {
         let headers = response.headers().get_all(FORWARDED);
         assert_eq!(headers.iter().count(), 2);
 
-        let chain = ForwardingChain::new(response.headers());
+        let chain = Forwarded::chain_from_headers(response.headers());
         assert_eq!(chain.len(), 2);
         assert_eq!(chain.flat_iter().count(), 3);
 
-        let mut iter = chain.into_flat_iter();
+        let mut iter = chain.flat_into_iter();
         assert_eq!(
-            iter.next().unwrap().into_record().unwrap(),
+            iter.next().unwrap().into_value().unwrap(),
             Forwarded {
                 r#for: Some(Forwardee::Address("192.0.2.5".parse().unwrap())),
                 proto: Some(ForwardProtocol::Https),
@@ -1905,7 +1559,7 @@ mod tests {
         );
 
         assert_eq!(
-            iter.next().unwrap().into_record().unwrap(),
+            iter.next().unwrap().into_value().unwrap(),
             Forwarded {
                 r#for: Some(Forwardee::Address(
                     "[2001:db8:cafe::17]:4711".parse().unwrap()
@@ -1915,7 +1569,7 @@ mod tests {
         );
 
         assert_eq!(
-            iter.next().unwrap().into_record().unwrap(),
+            iter.next().unwrap().into_value().unwrap(),
             Forwarded {
                 r#for: Some(Forwardee::Unknown),
                 host: Some("example.com".parse().unwrap()),
@@ -1931,7 +1585,7 @@ mod tests {
             tower::service_fn(|req: http::Request<()>| async { Ok::<_, ()>(req) }),
             Default::default(),
             false,
-            ForwardedHeaderAppend::KeepFirst,
+            AppendHeaderRecordMode::KeepFirst,
         );
 
         let mut request = http::Request::get("http://example.com").body(()).unwrap();
@@ -1947,13 +1601,13 @@ mod tests {
         let headers = response.headers().get_all(FORWARDED);
         assert_eq!(headers.iter().count(), 1);
 
-        let chain = ForwardingChain::new(response.headers());
+        let chain = Forwarded::chain_from_headers(response.headers());
         assert_eq!(chain.len(), 1);
         assert_eq!(chain.flat_iter().count(), 1);
 
-        let mut iter = chain.into_flat_iter();
+        let mut iter = chain.flat_into_iter();
         assert_eq!(
-            iter.next().unwrap().into_record().unwrap(),
+            iter.next().unwrap().into_value().unwrap(),
             Forwarded {
                 r#for: Some(Forwardee::Address("192.0.2.4".parse().unwrap())),
                 ..Default::default()

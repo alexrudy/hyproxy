@@ -1,5 +1,6 @@
 //! Proxy headers management.
 
+pub mod chain;
 pub mod forward;
 pub mod hopby;
 pub mod via;

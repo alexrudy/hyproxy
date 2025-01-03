@@ -166,12 +166,16 @@ impl ops::Deref for QuotedString {
     }
 }
 
-const fn is_visible_ascii(b: u8) -> bool {
-    b >= 32 && b < 127 || b == b'\t'
+pub(crate) const fn is_valid(c: u8) -> bool {
+    c == b' ' || c == b'\t' || (c > 0x21 && c < 0x7F) || (c > 0x7F)
+}
+
+pub(crate) const fn is_visible_ascii(c: u8) -> bool {
+    c >= 32 && c < 127 || c == b'\t'
 }
 
 const fn is_qd_text(c: u8) -> bool {
-    (c == b' ' || c == b'\t' || (c > 0x21 && c < 0x7F && c != b'\\' && c != b'"')) || (c > 0x7F)
+    is_valid(c) && c != b'\\' && c != b'"'
 }
 
 const fn is_escapable(second: u8) -> bool {

@@ -277,7 +277,6 @@ dependencies = [
 name = "hyproxy"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "http",
  "hyper",
  "hyperdriver",
