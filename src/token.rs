@@ -16,17 +16,6 @@ pub(crate) fn is_rfc7230_token(item: &str) -> bool {
 #[error("invalid RFC-7230 token")]
 pub struct InvalidToken(pub String);
 
-pub(crate) fn rfc7230_protocol(item: &str) -> Result<&str, InvalidToken> {
-    if item
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || RFC_7230_TOKEN_SPECIAL.contains(&c) || c == '/')
-    {
-        Ok(item)
-    } else {
-        Err(InvalidToken(item.to_string()))
-    }
-}
-
 /// A token as defined by RFC-7230.
 #[derive(Debug, PartialEq, Eq, Clone, PartialOrd, Ord, Hash)]
 pub struct Token(String);

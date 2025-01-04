@@ -11,8 +11,6 @@ use std::{fmt::Debug, ops, str::FromStr};
 
 use http::HeaderMap;
 
-use crate::token::is_valid;
-
 /// A header chain is a grouping of multiple header values,
 /// all associated with a single header name.
 #[derive(Default, Clone, PartialEq, Eq)]
@@ -586,10 +584,11 @@ impl<T> Record<T> {
     /// This is private because it assumes that the raw value consists
     /// only of bytes that are valid in a header value.
     fn from_raw(value: Vec<u8>) -> Self {
-        debug_assert!(
-            value.iter().all(|c| is_valid(*c)),
-            "Raw header values must be valid header bytes"
-        );
+        // debug_assert!(
+        //     value.iter().all(|c| is_valid(*c)),
+        //     "Raw header values must be valid header bytes"
+        // );
+        //TODO: Validate bytes?
 
         Self(RecordEntry::Raw(value))
     }

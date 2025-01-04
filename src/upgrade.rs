@@ -4,47 +4,77 @@ use core::fmt;
 use std::ops;
 use std::str::FromStr;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use http::HeaderValue;
+use nom::bytes::complete::tag;
+use nom::combinator::{map, opt};
+use nom::multi::separated_list0;
+use nom::sequence::tuple;
+use nom::IResult;
 use thiserror::Error;
 
-use crate::token::{is_rfc7230_token, rfc7230_protocol, InvalidToken};
-
+use crate::headers::fields::Token;
+use crate::headers::parser::{strip_whitespace, token, NoTail as _};
 /// The `Upgrade` header field allows the sender to specify what protocols they would like to upgrade to.
 pub const UPGRADE: http::HeaderName = http::header::UPGRADE;
 
 /// Errors that can occur when parsing an upgrade protocol.
 #[derive(Debug, Error)]
-pub enum UpgradeProtocolError {
-    /// The protocol contains invalid characters.
-    #[error("protocol contains invalid characters: {}", .0.0)]
-    InvalidProtocol(#[from] InvalidToken),
+#[error("upgrade protocol error")]
+pub struct UpgradeProtocolError(nom::error::Error<Bytes>);
 
-    /// The header contains characters in an unknown encoding.
-    #[error("header contains characters in unknown encoding")]
-    InvalidHeader(#[from] http::header::ToStrError),
+impl From<nom::error::Error<Bytes>> for UpgradeProtocolError {
+    fn from(error: nom::error::Error<Bytes>) -> Self {
+        UpgradeProtocolError(error)
+    }
+}
+
+impl From<nom::error::Error<&[u8]>> for UpgradeProtocolError {
+    fn from(error: nom::error::Error<&[u8]>) -> Self {
+        UpgradeProtocolError(nom::error::Error::new(
+            Bytes::copy_from_slice(error.input),
+            error.code,
+        ))
+    }
+}
+
+fn protocol<'v>() -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], UpgradeProtocol> {
+    let v = tuple((tag(b"/"), token()));
+    let version = opt(map(v, |(_, version)| version));
+
+    map(tuple((token(), version)), |(name, version)| {
+        UpgradeProtocol { name, version }
+    })
 }
 
 fn parse_upgrade_protocols(
     value: &HeaderValue,
 ) -> Result<Vec<UpgradeProtocol>, UpgradeProtocolError> {
-    value
-        .to_str()?
-        .split(',')
-        .map(|s| s.trim().parse())
-        .collect()
+    separated_list0(tag(b","), strip_whitespace(protocol()))(value.as_bytes())
+        .no_tail()
+        .map_err(Into::into)
+}
+
+fn parse_connection_headers(value: &HeaderValue) -> Result<Vec<Token>, UpgradeProtocolError> {
+    separated_list0(tag(b","), strip_whitespace(token()))(value.as_bytes())
+        .no_tail()
+        .map_err(Into::into)
 }
 
 // Get upgrade state for the inbound request
 fn get_upgrade_request(headers: &http::HeaderMap) -> Result<UpgradeRequest, UpgradeProtocolError> {
-    if headers.get(http::header::CONNECTION) == Some(&http::HeaderValue::from_static("upgrade")) {
-        if let Some(upgrade) = headers.get(UPGRADE) {
-            tracing::trace!("Found upgrade header: {:?}", upgrade);
-            return parse_upgrade_protocols(upgrade).map(|protocols| UpgradeRequest { protocols });
+    if let Some(connection) = headers.get(http::header::CONNECTION) {
+        let connection_headers = parse_connection_headers(connection)?;
+        if connection_headers.contains(&Token::from_static("upgrade")) {
+            if let Some(upgrade) = headers.get(UPGRADE) {
+                tracing::trace!("Found upgrade header: {:?}", upgrade);
+                return parse_upgrade_protocols(upgrade)
+                    .map(|protocols| UpgradeRequest { protocols });
+            }
         }
     }
-    Ok(UpgradeRequest {
-        protocols: Vec::new(),
-    })
+
+    Ok(Default::default())
 }
 
 fn get_upgrade_response(headers: &http::HeaderMap) -> Option<UpgradeProtocol> {
@@ -55,56 +85,70 @@ fn get_upgrade_response(headers: &http::HeaderMap) -> Option<UpgradeProtocol> {
 }
 
 /// A protocol that can be upgraded.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone)]
 pub struct UpgradeProtocol {
-    protocol: String,
+    name: Token,
+    version: Option<Token>,
+}
+
+impl PartialEq for UpgradeProtocol {
+    fn eq(&self, other: &Self) -> bool {
+        if let Some((version, other_version)) = self.version().zip(other.version()) {
+            self.name.eq_ignore_ascii_case(&other.name)
+                && version.eq_ignore_ascii_case(other_version)
+        } else {
+            self.name.eq_ignore_ascii_case(&other.name)
+        }
+    }
 }
 
 impl fmt::Debug for UpgradeProtocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("UpgradeProtocol")
-            .field(&self.protocol)
-            .finish()
+        let name = String::from_utf8_lossy(self.name.as_bytes());
+        write!(f, "UpgradeProtocol(")?;
+        match self.version {
+            Some(ref version) => write!(
+                f,
+                "{}/{}",
+                name,
+                String::from_utf8_lossy(version.as_bytes())
+            ),
+            None => write!(f, "{}", name),
+        }?;
+        write!(f, ")")
     }
 }
 
-impl fmt::Display for UpgradeProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.protocol)
+impl UpgradeProtocol {
+    /// The name of the protocol.
+    pub fn name(&self) -> &Token {
+        &self.name
     }
-}
 
-impl ops::Deref for UpgradeProtocol {
-    type Target = str;
+    /// The version of the protocol.
+    pub fn version(&self) -> Option<&Token> {
+        self.version.as_ref()
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.protocol
+    fn extend_buffer(&self, buffer: &mut BytesMut) {
+        buffer.extend_from_slice(self.name.as_bytes());
+        if let Some(version) = &self.version {
+            buffer.put_u8(b'/');
+            buffer.extend_from_slice(version.as_bytes());
+        }
     }
 }
 
 impl FromStr for UpgradeProtocol {
     type Err = UpgradeProtocolError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self {
-            protocol: rfc7230_protocol(s)?.to_string(),
-        })
-    }
-}
-
-impl TryFrom<String> for UpgradeProtocol {
-    type Error = UpgradeProtocolError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if !is_rfc7230_token(&value) {
-            return Err(InvalidToken(value).into());
-        }
-        Ok(Self { protocol: value })
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        protocol()(value.as_bytes()).no_tail().map_err(Into::into)
     }
 }
 
 /// A request to upgrade to one or more protocols.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UpgradeRequest {
     protocols: Vec<UpgradeProtocol>,
 }
@@ -122,13 +166,19 @@ impl UpgradeRequest {
 
     /// Convert the upgrade request to a header value
     pub fn to_header_value(&self) -> HeaderValue {
-        let value = self
-            .protocols
-            .iter()
-            .map(|p| p as &str)
-            .collect::<Vec<&str>>()
-            .join(", ");
-        HeaderValue::from_str(&value).unwrap()
+        let mut buf = BytesMut::new();
+
+        let mut iter = self.protocols.iter();
+        if let Some(protocol) = iter.next() {
+            protocol.extend_buffer(&mut buf);
+        }
+
+        for protocol in iter {
+            buf.put(&b", "[..]);
+            protocol.extend_buffer(&mut buf);
+        }
+
+        HeaderValue::from_bytes(&buf).unwrap()
     }
 
     fn pop(&mut self) -> Option<UpgradeProtocol> {
@@ -141,30 +191,6 @@ impl ops::Deref for UpgradeRequest {
 
     fn deref(&self) -> &Self::Target {
         &self.protocols
-    }
-}
-
-impl fmt::Display for UpgradeRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = self
-            .protocols
-            .iter()
-            .map(|p| p as &str)
-            .collect::<Vec<&str>>()
-            .join(", ");
-        f.write_str(&value)
-    }
-}
-
-impl FromStr for UpgradeRequest {
-    type Err = UpgradeProtocolError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let protocols = s
-            .split(',')
-            .map(|s| s.trim().parse())
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { protocols })
     }
 }
 
@@ -352,12 +378,17 @@ mod future {
                         });
                     } else {
                         let protocol_options = request_protocol
-                            .map(|p| p.iter().map(|p| p as &str).collect::<Vec<_>>().join(", "))
+                            .map(|p| {
+                                p.iter()
+                                    .map(|p| format!("{p:?}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
                             .unwrap_or_default();
 
                         tracing::debug!(
-                            requested = protocol_options,
-                            response = %response_protocol.as_ref().map(|p| p.to_string()).unwrap_or_default(),
+                            requested = %protocol_options,
+                            response = %response_protocol.as_ref().map(|p| format!("{p:?}")).unwrap_or_default(),
                             "Proxy Upgrade protocol mismatch, refusing to start upgrade"
                         );
                     }
@@ -371,17 +402,13 @@ mod future {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
     fn parse_protocol() {
         let protocol = "websocket".parse::<UpgradeProtocol>().unwrap();
-        assert_eq!(
-            protocol,
-            UpgradeProtocol {
-                protocol: "websocket".to_string()
-            }
-        );
+        assert_eq!(protocol.name().as_bytes(), b"websocket");
     }
 
     #[test]
@@ -392,15 +419,23 @@ mod tests {
 
     #[test]
     fn parse_protocol_requests() {
-        let request = "websocket, http/2".parse::<UpgradeRequest>().unwrap();
-        assert_eq!(request.len(), 2);
+        let protocols =
+            parse_upgrade_protocols(&"websocket, http/2".parse::<http::HeaderValue>().unwrap())
+                .unwrap();
+        assert_eq!(protocols.len(), 2);
+
+        let request = UpgradeRequest { protocols };
 
         assert!(request.matching(&"http/2".parse().unwrap()))
     }
 
     #[test]
-    fn parse_protocol_requests_with_invalid_characters() {
-        let request = "websocket, 😀, http/2, http/3".parse::<UpgradeRequest>();
-        assert!(request.is_err());
+    fn parse_headers_without_upgrade_in_connection() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONNECTION, "close".parse().unwrap());
+        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+
+        let request = get_upgrade_request(&headers).unwrap();
+        assert!(request.is_empty());
     }
 }

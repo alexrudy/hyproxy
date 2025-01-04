@@ -1,8 +1,10 @@
 //! Proxy headers management.
 
 pub mod chain;
+pub mod fields;
 pub mod forward;
 pub mod hopby;
+pub(crate) mod parser;
 pub mod via;
 
 pub use forward::{

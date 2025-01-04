@@ -7,5 +7,5 @@
 #![deny(unsafe_code)]
 
 pub mod headers;
-mod token;
+pub(crate) mod token;
 pub mod upgrade;
