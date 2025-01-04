@@ -6,7 +6,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{AddrParseError, IpAddr, Ipv6Addr, SocketAddr};
-use std::ops::Deref;
 use std::str::FromStr;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -180,7 +179,7 @@ impl Forwarded {
         }
 
         if let Some(scheme) = request.uri().scheme() {
-            proto = scheme.try_into().ok();
+            proto = Some(scheme.clone().into());
         }
 
         Forwarded {
@@ -248,16 +247,15 @@ impl Forwarded {
         }
 
         if let Some(host) = &self.host {
-            request.headers_mut().append(
-                X_FORWARDED_HOST,
-                http::HeaderValue::from_bytes(host.as_bytes().as_ref()).unwrap(),
-            );
+            request
+                .headers_mut()
+                .append(X_FORWARDED_HOST, host.x_forwarded().as_header_value());
         }
 
         if let Some(proto) = &self.proto {
             request
                 .headers_mut()
-                .append(X_FORWARDED_PROTO, proto.to_string().parse().unwrap());
+                .append(X_FORWARDED_PROTO, proto.x_forwarded().as_header_value());
         }
     }
 
@@ -284,7 +282,7 @@ impl Forwarded {
 
         if let Some(proto) = &self.proto {
             bytes.put(&b"proto="[..]);
-            bytes.put(proto.to_string().as_bytes());
+            bytes.put(proto.as_bytes());
             bytes.put_u8(b';');
         }
 
@@ -412,16 +410,19 @@ impl ParseChainRecord for Forwarded {
 
         let proto = data
             .remove(&ForwardedKey::PROTO)
-            .map(
-                |value| match value.as_bytes().to_ascii_lowercase().deref() {
-                    b"http" => Ok(ForwardProtocol::Http),
-                    b"https" => Ok(ForwardProtocol::Https),
-                    _ => Err(ParseForwadingErrorKind::InvalidScheme {
+            .map(|value| {
+                let v =
+                    std::str::from_utf8(value.as_bytes()).map_err(|error| ParseForwardedError {
+                        kind: ParseForwadingErrorKind::NonUtf8Proto { error },
+                    })?;
+
+                ForwardProtocol::from_str(v).map_err(|error| ParseForwardedError {
+                    kind: ParseForwadingErrorKind::InvalidScheme {
                         key: "proto".to_string(),
-                        error: UnsupportedProtocol(Bytes::copy_from_slice(value.as_bytes())),
-                    }),
-                },
-            )
+                        error,
+                    },
+                })
+            })
             .transpose()?;
 
         Ok(Forwarded {
@@ -474,7 +475,13 @@ enum ParseForwadingErrorKind {
     #[error("invalid protocol for FORWARDED ({key}): {error}")]
     InvalidScheme {
         key: String,
-        error: UnsupportedProtocol,
+        error: http::uri::InvalidUri,
+    },
+
+    #[error("invalid protocol for FORWARDED (proto): {error}")]
+    NonUtf8Proto {
+        #[source]
+        error: std::str::Utf8Error,
     },
 }
 
@@ -590,51 +597,43 @@ impl XForwardee {
 ///
 /// Only `http` and `https` are supported by [RFC-2739](https://datatracker.ietf.org/doc/html/rfc7239)
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub enum ForwardProtocol {
-    /// The request was forwarded using the HTTP protocol.
-    Http,
+pub struct ForwardProtocol(http::uri::Scheme);
 
-    /// The request was forwarded using the HTTPS protocol.
-    Https,
-}
+impl ForwardProtocol {
+    /// Convert the `ForwardProtocol` to a byte string.
+    pub fn as_bytes(&self) -> Bytes {
+        Bytes::copy_from_slice(self.0.as_str().as_bytes())
+    }
 
-impl fmt::Display for ForwardProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ForwardProtocol::Http => write!(f, "http"),
-            ForwardProtocol::Https => write!(f, "https"),
-        }
+    /// Create the X-Forwarded header value for the `ForwardProtocol`.
+    pub fn x_forwarded(&self) -> XForwardedProtocol<'_> {
+        XForwardedProtocol(self)
     }
 }
 
-/// An error indicating that the protocol in a forwarded header is not supported by [RFC-2739](https://datatracker.ietf.org/doc/html/rfc7239).
-#[derive(Debug, Error)]
-#[error("Unsupported protocol {0:?} for forwarded header")]
-pub struct UnsupportedProtocol(Bytes);
+/// The X-FORWARDED-PROTO header, a de-facto standard header for identifying the protocol (HTTP or HTTPS)
+/// that a client used to connect to a proxy or load balancer.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct XForwardedProtocol<'a>(&'a ForwardProtocol);
 
-impl TryFrom<&http::uri::Scheme> for ForwardProtocol {
-    type Error = UnsupportedProtocol;
+impl XForwardedProtocol<'_> {
+    /// Convert the `ForwardProtocol` to a `http::HeaderValue`.
+    pub fn as_header_value(&self) -> http::HeaderValue {
+        http::HeaderValue::from_bytes(self.0.as_bytes().as_ref()).unwrap()
+    }
+}
 
-    fn try_from(scheme: &http::uri::Scheme) -> Result<Self, Self::Error> {
-        match scheme.as_str() {
-            "http" => Ok(ForwardProtocol::Http),
-            "https" => Ok(ForwardProtocol::Https),
-            _ => Err(UnsupportedProtocol(Bytes::copy_from_slice(
-                scheme.to_string().as_bytes(),
-            ))),
-        }
+impl From<http::uri::Scheme> for ForwardProtocol {
+    fn from(scheme: http::uri::Scheme) -> Self {
+        ForwardProtocol(scheme)
     }
 }
 
 impl FromStr for ForwardProtocol {
-    type Err = UnsupportedProtocol;
+    type Err = http::uri::InvalidUri;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "http" => Ok(ForwardProtocol::Http),
-            "https" => Ok(ForwardProtocol::Https),
-            _ => Err(UnsupportedProtocol(Bytes::copy_from_slice(s.as_bytes()))),
-        }
+        http::uri::Scheme::from_str(s).map(ForwardProtocol)
     }
 }
 
@@ -894,13 +893,8 @@ impl ForwardedHost {
         bytes.freeze()
     }
 
-    /// Convert the `ForwardedHost` to a `http::HeaderValue`.
-    pub fn as_header_value(&self) -> http::HeaderValue {
-        http::HeaderValue::from_bytes(self.as_bytes().as_ref()).unwrap()
-    }
-
     /// Create the X-Forwarded header value for the `ForwardedHost`.
-    pub fn x_forwarded(self) -> XForwardedHost {
+    pub fn x_forwarded(&self) -> XForwardedHost {
         XForwardedHost(self)
     }
 
@@ -929,12 +923,12 @@ impl FromStr for ForwardedHost {
 
 /// An address used in a `X-Forwarded-Host` header.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct XForwardedHost(ForwardedHost);
+pub struct XForwardedHost<'a>(&'a ForwardedHost);
 
-impl XForwardedHost {
+impl XForwardedHost<'_> {
     /// The `X-Forwarded-Host` header value for the `XForwardedHost`.
-    pub fn header_value(&self) -> http::HeaderValue {
-        self.0.as_header_value()
+    pub fn as_header_value(&self) -> http::HeaderValue {
+        http::HeaderValue::from_bytes(self.0.as_bytes().as_ref()).unwrap()
     }
 }
 
@@ -1257,25 +1251,6 @@ mod tests {
     }
 
     #[test]
-    fn forward_protocol_display() {
-        assert_eq!(format!("{}", ForwardProtocol::Http), "http");
-        assert_eq!(format!("{}", ForwardProtocol::Https), "https");
-    }
-
-    #[test]
-    fn forward_protocol_try_from() {
-        assert_eq!(
-            ForwardProtocol::try_from(&http::uri::Scheme::HTTP).unwrap(),
-            ForwardProtocol::Http
-        );
-        assert_eq!(
-            ForwardProtocol::try_from(&http::uri::Scheme::HTTPS).unwrap(),
-            ForwardProtocol::Https
-        );
-        assert!(ForwardProtocol::try_from(&http::uri::Scheme::try_from("ftp").unwrap()).is_err());
-    }
-
-    #[test]
     fn forwarded_bytes() {
         let forwarded = Forwarded {
             r#for: Some(Forwardee::Address(
@@ -1291,7 +1266,7 @@ mod tests {
 
         let forwarded = Forwarded {
             r#for: Some(Forwardee::Address("192.0.2.60".parse().unwrap())),
-            proto: Some(ForwardProtocol::Http),
+            proto: Some(http::uri::Scheme::HTTP.into()),
             by: Some(Forwardee::Address("203.0.113.43".parse().unwrap())),
             ..Default::default()
         };
@@ -1310,7 +1285,7 @@ mod tests {
 
         let expected = Forwarded {
             r#for: Some(Forwardee::Address("192.0.2.60".parse().unwrap())),
-            proto: Some(ForwardProtocol::Https),
+            proto: Some(http::uri::Scheme::HTTPS.into()),
             ..Default::default()
         }
         .into();
@@ -1366,7 +1341,7 @@ mod tests {
                 r#for: Some(Forwardee::Address(
                     "[2001:db8:cafe::18]:8080".parse().unwrap()
                 )),
-                proto: Some(ForwardProtocol::Https),
+                proto: Some(http::uri::Scheme::HTTPS.into()),
                 ..Default::default()
             },
         );
@@ -1389,7 +1364,7 @@ mod tests {
         assert_eq!(
             Forwarded {
                 r#for: Some(Forwardee::Address("192.0.2.60".parse().unwrap())),
-                proto: Some(ForwardProtocol::Http),
+                proto: Some(http::uri::Scheme::HTTP.into()),
                 by: Some(Forwardee::Address("203.0.113.43".parse().unwrap())),
                 ..Default::default()
             },
@@ -1709,7 +1684,7 @@ mod tests {
             iter.next().unwrap().into_value().unwrap(),
             Forwarded {
                 r#for: Some(Forwardee::Address("192.0.2.5".parse().unwrap())),
-                proto: Some(ForwardProtocol::Https),
+                proto: Some(http::uri::Scheme::HTTPS.into()),
                 ..Default::default()
             },
         );
@@ -1729,7 +1704,7 @@ mod tests {
             Forwarded {
                 r#for: Some(Forwardee::Unknown),
                 host: Some("example.com".parse().unwrap()),
-                proto: Some(ForwardProtocol::Http),
+                proto: Some(http::uri::Scheme::HTTP.into()),
                 ..Default::default()
             },
         );
