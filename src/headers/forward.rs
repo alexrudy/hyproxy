@@ -6,17 +6,21 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{AddrParseError, IpAddr, Ipv6Addr, SocketAddr};
+use std::ops::Deref;
 use std::str::FromStr;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use hyperdriver::info::ConnectionInfo;
+use nom::Finish;
 use thiserror::Error;
 
-use crate::token::{FieldValue, InvalidToken, Token};
+use super::fields::{FieldValue, Token};
 
 use super::chain::{
     AppendHeaderRecordMode, FromRequest, Header, HeaderChain, ParseChainRecord, Record,
     ToChainRecord,
 };
+use super::parser::NoTail;
 
 /// The `Forwarded` header, a standard header for identifying the originating IP address of a client connecting to a web server through a proxy server.
 ///
@@ -134,13 +138,13 @@ impl ForwardedRecord {
 /// The contents of one record in a `Forwarded` header.
 ///
 /// A forwarded header can consist of multiple comma-separated records, each containing a set of key-value pairs.
-#[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct Forwarded {
     by: Option<Forwardee>,
     r#for: Option<Forwardee>,
-    host: Option<String>,
+    host: Option<ForwardedHost>,
     proto: Option<ForwardProtocol>,
-    extensions: BTreeMap<Token, FieldValue>,
+    extensions: BTreeMap<ForwardedKey, FieldValue>,
 }
 
 impl Forwarded {
@@ -167,8 +171,12 @@ impl Forwarded {
             tracing::warn!("No connection info found in request extensions");
         }
 
-        if let Some(header) = request.headers().get(http::header::HOST) {
-            host = header.to_str().ok().map(|s| s.to_string());
+        if let Some(host_header) = request
+            .headers()
+            .get(http::header::HOST)
+            .and_then(|h| ForwardedHost::parse_bytes(h.as_bytes()).ok())
+        {
+            host = Some(host_header);
         }
 
         if let Some(scheme) = request.uri().scheme() {
@@ -186,13 +194,7 @@ impl Forwarded {
 
     /// Create a new `Forwarded` header from a header value.
     pub fn from_header_value(value: &http::HeaderValue) -> Result<Self, ParseForwardedError> {
-        let value = value.to_str().map_err(|err| ParseForwardedError {
-            kind: ParseForwadingErrorKind::InvalidHeaderValue {
-                source: err,
-                header: value.clone(),
-            },
-        })?;
-        Forwarded::from_str(value)
+        Self::parse_record(value.as_bytes())
     }
 
     /// Check if any of the fields are set.
@@ -213,8 +215,8 @@ impl Forwarded {
     }
 
     /// The `host` field of the `Forwarded` header, which identifies the original host requested by the client.
-    pub fn host(&self) -> Option<&str> {
-        self.host.as_deref()
+    pub fn host(&self) -> Option<&ForwardedHost> {
+        self.host.as_ref()
     }
 
     /// The `proto` field of the `Forwarded` header, which identifies the protocol used by the client to connect to the proxy.
@@ -223,12 +225,12 @@ impl Forwarded {
     }
 
     /// The extensions in the `Forwarded` header.
-    pub fn extensions(&self) -> &BTreeMap<Token, FieldValue> {
+    pub fn extensions(&self) -> &BTreeMap<ForwardedKey, FieldValue> {
         &self.extensions
     }
 
     /// Mutable reference to the extensions in the `Forwarded` header.
-    pub fn extensions_mut(&mut self) -> &mut BTreeMap<Token, FieldValue> {
+    pub fn extensions_mut(&mut self) -> &mut BTreeMap<ForwardedKey, FieldValue> {
         &mut self.extensions
     }
 
@@ -246,9 +248,10 @@ impl Forwarded {
         }
 
         if let Some(host) = &self.host {
-            request
-                .headers_mut()
-                .append(X_FORWARDED_HOST, host.parse().unwrap());
+            request.headers_mut().append(
+                X_FORWARDED_HOST,
+                http::HeaderValue::from_bytes(host.as_bytes().as_ref()).unwrap(),
+            );
         }
 
         if let Some(proto) = &self.proto {
@@ -258,9 +261,51 @@ impl Forwarded {
         }
     }
 
+    /// Convert this `Forwarded` header to a byte string.
+    pub fn as_bytes(&self) -> Bytes {
+        let mut bytes = BytesMut::new();
+        if let Some(forwardee) = &self.by {
+            bytes.put(&b"by="[..]);
+            bytes.put(forwardee.as_bytes());
+            bytes.put_u8(b';');
+        }
+
+        if let Some(forwardee) = &self.r#for {
+            bytes.put(&b"for="[..]);
+            bytes.put(forwardee.as_bytes());
+            bytes.put_u8(b';');
+        }
+
+        if let Some(host) = &self.host {
+            bytes.put(&b"host="[..]);
+            bytes.put(host.as_bytes());
+            bytes.put_u8(b';');
+        }
+
+        if let Some(proto) = &self.proto {
+            bytes.put(&b"proto="[..]);
+            bytes.put(proto.to_string().as_bytes());
+            bytes.put_u8(b';');
+        }
+
+        for (key, value) in &self.extensions {
+            bytes.put(key.as_bytes());
+            bytes.put_u8(b'=');
+            bytes.put(value.as_bytes());
+            bytes.put_u8(b';');
+        }
+
+        if !bytes.is_empty() {
+            bytes.truncate(bytes.len() - 1);
+        }
+
+        bytes.freeze()
+    }
+
     /// Convert this `Forwarded` header to a `http::HeaderValue`.
     pub fn to_header_value(&self) -> http::HeaderValue {
-        http::HeaderValue::try_from(self.to_string()).expect("valid header from typed Forwarded")
+        http::HeaderValue::from_bytes(self.as_bytes().as_ref())
+            .expect("valid header from typed Forwarded")
     }
 
     /// Set the `Forwarded` header on a request.
@@ -283,39 +328,37 @@ impl Forwarded {
     }
 }
 
-impl fmt::Display for Forwarded {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut parts = Vec::new();
-
-        if let Some(by) = &self.by {
-            parts.push(format!("by={}", by));
-        }
-
-        if let Some(r#for) = &self.r#for {
-            parts.push(format!("for={}", r#for));
-        }
-
-        if let Some(host) = &self.host {
-            parts.push(format!("host={}", host));
-        }
-
-        if let Some(proto) = &self.proto {
-            parts.push(format!("proto={}", proto));
-        }
-
-        for (key, value) in &self.extensions {
-            parts.push(format!("{}={}", key, value));
-        }
-
-        write!(f, "{}", parts.join("; "))
-    }
-}
-
 impl ToChainRecord for Forwarded {
     const HEADER_NAME: http::HeaderName = FORWARDED;
 
     fn into_bytes(self) -> Vec<u8> {
-        self.to_string().into_bytes()
+        self.as_bytes().to_vec()
+    }
+}
+
+mod parse {
+
+    use nom::character::complete::char;
+    use nom::multi::separated_list1;
+    use nom::sequence::separated_pair;
+    use nom::IResult;
+
+    use crate::headers::fields::{FieldValue, Token};
+    use crate::headers::parser::{record, strip_whitespace, token};
+
+    fn forwarded_key_value<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], (Token, FieldValue)> {
+        separated_pair(
+            strip_whitespace(token()),
+            char('='),
+            strip_whitespace(record()),
+        )
+    }
+
+    pub type ForwardedRecord = Vec<(Token, FieldValue)>;
+
+    pub(super) fn forwarded_record<'a>(
+    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], ForwardedRecord> {
+        separated_list1(char(';'), forwarded_key_value())
     }
 }
 
@@ -328,7 +371,66 @@ impl ParseChainRecord for Forwarded {
     where
         Self: Sized,
     {
-        std::str::from_utf8(value)?.parse()
+        let records = parse::forwarded_record()(value)
+            .finish()
+            .no_tail()
+            .map_err(|error| ParseForwardedError {
+                kind: ParseForwadingErrorKind::MalformedRecord(nom::error::Error::new(
+                    Bytes::copy_from_slice(error.input),
+                    error.code,
+                )),
+            })?;
+
+        let mut data: BTreeMap<_, _> = BTreeMap::new();
+
+        for (key, value) in records
+            .into_iter()
+            .map(|(key, value)| (ForwardedKey(key), value))
+        {
+            if data.contains_key(&key) {
+                return Err(ParseForwardedError {
+                    kind: ParseForwadingErrorKind::DuplicateField(key),
+                });
+            }
+
+            data.insert(key, value);
+        }
+
+        let by = data
+            .remove(&ForwardedKey::BY)
+            .map(Forwardee::try_from)
+            .transpose()?;
+
+        let r#for = data
+            .remove(&ForwardedKey::FOR)
+            .map(Forwardee::try_from)
+            .transpose()?;
+        let host = data
+            .remove(&ForwardedKey::HOST)
+            .map(|value| ForwardedHost::parse_bytes(value.as_bytes()))
+            .transpose()?;
+
+        let proto = data
+            .remove(&ForwardedKey::PROTO)
+            .map(
+                |value| match value.as_bytes().to_ascii_lowercase().deref() {
+                    b"http" => Ok(ForwardProtocol::Http),
+                    b"https" => Ok(ForwardProtocol::Https),
+                    _ => Err(ParseForwadingErrorKind::InvalidScheme {
+                        key: "proto".to_string(),
+                        error: UnsupportedProtocol(Bytes::copy_from_slice(value.as_bytes())),
+                    }),
+                },
+            )
+            .transpose()?;
+
+        Ok(Forwarded {
+            by,
+            r#for,
+            host,
+            proto,
+            extensions: data,
+        })
     }
 }
 
@@ -342,126 +444,20 @@ impl FromStr for Forwarded {
     type Err = ParseForwardedError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut by = None;
-        let mut r#for = None;
-        let mut host = None;
-        let mut proto = None;
-        let mut extensions = BTreeMap::new();
-
-        for part in s.split(';') {
-            let (key, value) = part.split_once('=').ok_or_else(|| ParseForwardedError {
-                kind: ParseForwadingErrorKind::MalformedRecord(part.to_string()),
-            })?;
-
-            let key = key.trim();
-            let value = value.trim();
-
-            fn insert_or_error<T>(
-                field: &mut Option<T>,
-                value: T,
-                key: &str,
-            ) -> Result<(), ParseForwardedError> {
-                if field.is_some() {
-                    return Err(ParseForwardedError {
-                        kind: ParseForwadingErrorKind::DuplicateField(key.to_string()),
-                    });
-                }
-
-                *field = Some(value);
-                Ok(())
-            }
-
-            match key {
-                "by" => insert_or_error(
-                    &mut by,
-                    value.parse().map_err(|error| ParseForwardedError {
-                        kind: ParseForwadingErrorKind::InvalidNodeName {
-                            key: key.to_string(),
-                            error,
-                        },
-                    })?,
-                    key,
-                )?,
-                "for" => insert_or_error(
-                    &mut r#for,
-                    value.parse().map_err(|error| ParseForwardedError {
-                        kind: ParseForwadingErrorKind::InvalidNodeName {
-                            key: key.to_string(),
-                            error,
-                        },
-                    })?,
-                    key,
-                )?,
-                "host" => insert_or_error(
-                    &mut host,
-                    value
-                        .parse::<http::uri::Authority>()
-                        .map_err(|error| ParseForwardedError {
-                            kind: ParseForwadingErrorKind::InvalidHost { error },
-                        })?
-                        .host()
-                        .to_owned(),
-                    key,
-                )?,
-                "proto" => {
-                    let value = value.parse().map_err(|error| ParseForwardedError {
-                        kind: ParseForwadingErrorKind::InvalidScheme {
-                            key: key.to_string(),
-                            error,
-                        },
-                    })?;
-                    insert_or_error(&mut proto, value, key)?
-                }
-                key => {
-                    extensions.insert(
-                        key.parse().map_err(|_| ParseForwardedError {
-                            kind: ParseForwadingErrorKind::InvalidKey(key.into()),
-                        })?,
-                        value.parse().map_err(|error| ParseForwardedError {
-                            kind: ParseForwadingErrorKind::InvalidToken {
-                                key: key.to_string(),
-                                error,
-                            },
-                        })?,
-                    );
-                }
-            }
-        }
-
-        Ok(Forwarded {
-            by,
-            r#for,
-            host,
-            proto,
-            extensions,
-        })
+        Self::parse_record(s.as_bytes())
     }
 }
 
 #[derive(Debug, Error)]
 enum ParseForwadingErrorKind {
-    #[error("invalid key=value pair in FORWARDED: {0}")]
-    MalformedRecord(String),
+    #[error("invalid key=value pair in FORWARDED: {0:?}")]
+    MalformedRecord(nom::error::Error<Bytes>),
 
-    #[error("duplicate field in FORWARDED: {0}")]
-    DuplicateField(String),
+    #[error("duplicate field in FORWARDED: {0:?}")]
+    DuplicateField(ForwardedKey),
 
-    #[error("invalid key for FORWARDED: {0}")]
-    InvalidKey(String),
-
-    #[error("invalid characters in node name for FORWARDED ({key}): {error}")]
-    InvalidNodeName {
-        key: String,
-        #[source]
-        error: InvalidNameToken,
-    },
-
-    #[error("invalid characters in token for FORWARDED ({key}): {error}")]
-    InvalidToken {
-        key: String,
-        #[source]
-        error: InvalidToken,
-    },
+    #[error("invalid forwardee for FORWARDED: {0:?}")]
+    InvalidForwardee(Bytes),
 
     #[error("invalid host for FORWARDED (host): {error}")]
     InvalidHost {
@@ -469,23 +465,16 @@ enum ParseForwadingErrorKind {
         error: http::uri::InvalidUri,
     },
 
+    #[error("invalid host for FORWARDED (host): {error}")]
+    NonUtf8Host {
+        #[source]
+        error: std::str::Utf8Error,
+    },
+
     #[error("invalid protocol for FORWARDED ({key}): {error}")]
     InvalidScheme {
         key: String,
         error: UnsupportedProtocol,
-    },
-
-    #[error("header value for FORWARDED contains opaque bytes: {:?}", .header)]
-    InvalidHeaderValue {
-        #[source]
-        source: http::header::ToStrError,
-        header: http::header::HeaderValue,
-    },
-
-    #[error("invalid characters for FORWARDED: {error}")]
-    InvalidCharacters {
-        #[from]
-        error: std::str::Utf8Error,
     },
 }
 
@@ -516,7 +505,7 @@ where
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum Forwardee {
     /// The request was forwarded on a named interface.
-    Named(Box<str>),
+    Named(Token),
 
     /// The request was forwarded on an IP address.
     Address(ForwardAddress),
@@ -535,53 +524,53 @@ impl Forwardee {
             _ => None,
         }
     }
+
+    /// Convert the `Forwardee` to a byte string.
+    pub fn as_bytes(&self) -> Bytes {
+        match self {
+            Forwardee::Named(token) => {
+                let mut bytes = BytesMut::new();
+                bytes.put_u8(b'_');
+                bytes.put(token.as_bytes());
+                bytes.freeze()
+            }
+            Forwardee::Address(addr) => addr.as_bytes(),
+            Forwardee::Unknown => Bytes::from_static(b"unknown"),
+        }
+    }
 }
 
-impl fmt::Display for Forwardee {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Forwardee::Named(name) => write!(f, "_{}", name),
-            Forwardee::Address(addr) => write!(f, "{}", addr),
-            Forwardee::Unknown => write!(f, "unknown"),
+impl TryFrom<FieldValue> for Forwardee {
+    type Error = ParseForwardedError;
+
+    fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
+        if let Ok(data) = std::str::from_utf8(value.as_bytes()) {
+            if data == "unknown" {
+                return Ok(Forwardee::Unknown);
+            }
+
+            if let Ok(addr) = ForwardAddress::from_str(data) {
+                return Ok(Forwardee::Address(addr));
+            }
         }
+
+        if value.token().is_some() && value.as_bytes().first().is_some_and(|b| *b == b'_') {
+            let token = value.into_token().unwrap();
+
+            return Ok(Forwardee::Named(Token::new(token.into_bytes().slice(1..))));
+        }
+
+        Err(ParseForwardedError {
+            kind: ParseForwadingErrorKind::InvalidForwardee(Bytes::copy_from_slice(
+                value.as_bytes(),
+            )),
+        })
     }
 }
 
 impl From<SocketAddr> for Forwardee {
     fn from(addr: SocketAddr) -> Self {
         Forwardee::Address(addr.into())
-    }
-}
-
-/// Error indicating that a chacracter in a token is not valid.
-#[derive(Debug, Error)]
-#[error("invalid token: {0}")]
-pub struct InvalidNameToken(String);
-
-const FORWARDED_NAME_TOKENS: [char; 3] = ['.', '_', '-'];
-
-fn is_forwarded_name(value: &str) -> bool {
-    value.starts_with('_')
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || FORWARDED_NAME_TOKENS.contains(&c))
-}
-
-impl FromStr for Forwardee {
-    type Err = InvalidNameToken;
-
-    fn from_str(name: &str) -> Result<Self, Self::Err> {
-        if let Ok(addr) = name.parse::<ForwardAddress>() {
-            return Ok(Forwardee::Address(addr));
-        }
-
-        match name {
-            "unknown" => Ok(Forwardee::Unknown),
-            name if is_forwarded_name(name) => {
-                Ok(Forwardee::Named(name.strip_prefix('_').unwrap().into()))
-            }
-            name => Err(InvalidNameToken(name.into())),
-        }
     }
 }
 
@@ -620,8 +609,8 @@ impl fmt::Display for ForwardProtocol {
 
 /// An error indicating that the protocol in a forwarded header is not supported by [RFC-2739](https://datatracker.ietf.org/doc/html/rfc7239).
 #[derive(Debug, Error)]
-#[error("Unsupported protocol {0} for forwarded header")]
-pub struct UnsupportedProtocol(String);
+#[error("Unsupported protocol {0:?} for forwarded header")]
+pub struct UnsupportedProtocol(Bytes);
 
 impl TryFrom<&http::uri::Scheme> for ForwardProtocol {
     type Error = UnsupportedProtocol;
@@ -630,7 +619,9 @@ impl TryFrom<&http::uri::Scheme> for ForwardProtocol {
         match scheme.as_str() {
             "http" => Ok(ForwardProtocol::Http),
             "https" => Ok(ForwardProtocol::Https),
-            _ => Err(UnsupportedProtocol(scheme.to_string())),
+            _ => Err(UnsupportedProtocol(Bytes::copy_from_slice(
+                scheme.to_string().as_bytes(),
+            ))),
         }
     }
 }
@@ -642,7 +633,7 @@ impl FromStr for ForwardProtocol {
         match s {
             "http" => Ok(ForwardProtocol::Http),
             "https" => Ok(ForwardProtocol::Https),
-            _ => Err(UnsupportedProtocol(s.to_string())),
+            _ => Err(UnsupportedProtocol(Bytes::copy_from_slice(s.as_bytes()))),
         }
     }
 }
@@ -690,6 +681,40 @@ impl ForwardAddress {
     /// Create the X-Forwarded header value for the `ForwardAddress`.
     pub fn x_forwarded(&self) -> XForwardAddress {
         XForwardAddress(*self)
+    }
+
+    /// Convert the `ForwardAddress` to a byte string.
+    pub fn as_bytes(&self) -> Bytes {
+        let mut bytes = BytesMut::new();
+
+        match &self.ip {
+            IpAddr::V4(ip) => {
+                bytes.put(ip.to_string().as_bytes());
+
+                if let Some(port) = &self.port {
+                    bytes.put_u8(b':');
+                    bytes.put(port.to_string().as_bytes());
+                }
+            }
+            IpAddr::V6(ip) => {
+                bytes.put_u8(b'"');
+                bytes.put_u8(b'[');
+                bytes.put(ip.to_string().as_bytes());
+                bytes.put_u8(b']');
+                if let Some(port) = &self.port {
+                    bytes.put_u8(b':');
+                    bytes.put(port.to_string().as_bytes());
+                }
+                bytes.put_u8(b'"');
+            }
+        }
+
+        bytes.freeze()
+    }
+
+    /// Convert the `ForwardAddress` to a `http::HeaderValue`.
+    pub fn as_header_value(&self) -> http::HeaderValue {
+        http::HeaderValue::from_bytes(self.as_bytes().as_ref()).unwrap()
     }
 }
 
@@ -832,6 +857,130 @@ impl fmt::Display for XForwardAddress {
     }
 }
 
+/// The `host` field of a `Forwarded` header,
+/// representing the original host requested by the client.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct ForwardedHost {
+    host: String,
+    port: Option<u16>,
+}
+
+impl ForwardedHost {
+    /// Create a new `ForwardedHost`.
+    pub fn new(host: String, port: Option<u16>) -> Self {
+        Self { host, port }
+    }
+
+    /// The host of the `ForwardedHost`.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The port of the `ForwardedHost`.
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    /// Convert the `ForwardedHost` to a byte string.
+    pub fn as_bytes(&self) -> Bytes {
+        let mut bytes = BytesMut::new();
+        bytes.put(self.host.as_bytes());
+
+        if let Some(port) = self.port {
+            bytes.put_u8(b':');
+            bytes.put(port.to_string().as_bytes());
+        }
+
+        bytes.freeze()
+    }
+
+    /// Convert the `ForwardedHost` to a `http::HeaderValue`.
+    pub fn as_header_value(&self) -> http::HeaderValue {
+        http::HeaderValue::from_bytes(self.as_bytes().as_ref()).unwrap()
+    }
+
+    /// Create the X-Forwarded header value for the `ForwardedHost`.
+    pub fn x_forwarded(self) -> XForwardedHost {
+        XForwardedHost(self)
+    }
+
+    /// Parse a `ForwardedHost` from a byte string.
+    pub fn parse_bytes(value: &[u8]) -> Result<Self, ParseForwardedError> {
+        let value = std::str::from_utf8(value).map_err(|error| ParseForwardedError {
+            kind: ParseForwadingErrorKind::NonUtf8Host { error },
+        })?;
+        Self::from_str(value).map_err(|error| ParseForwardedError {
+            kind: ParseForwadingErrorKind::InvalidHost { error },
+        })
+    }
+}
+
+impl FromStr for ForwardedHost {
+    type Err = http::uri::InvalidUri;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let authority = http::uri::Authority::from_str(s)?;
+        Ok(ForwardedHost {
+            host: authority.host().to_string(),
+            port: authority.port_u16(),
+        })
+    }
+}
+
+/// An address used in a `X-Forwarded-Host` header.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct XForwardedHost(ForwardedHost);
+
+impl XForwardedHost {
+    /// The `X-Forwarded-Host` header value for the `XForwardedHost`.
+    pub fn header_value(&self) -> http::HeaderValue {
+        self.0.as_header_value()
+    }
+}
+
+/// A key used in a `Forwarded` header.
+#[derive(Debug, Clone)]
+pub struct ForwardedKey(Token);
+
+impl ForwardedKey {
+    /// The interface where the request came in to the proxy server.
+    pub const BY: ForwardedKey = ForwardedKey(Token::from_static_unchecked("by"));
+
+    /// The client that initiated the request and subsequent proxies in a chain of proxies.
+    pub const FOR: ForwardedKey = ForwardedKey(Token::from_static_unchecked("for"));
+
+    /// The `host` request header field as received by the proxy.
+    pub const HOST: ForwardedKey = ForwardedKey(Token::from_static_unchecked("host"));
+
+    /// Indicates which protocol was used to make the request (typically "http" or "https").
+    pub const PROTO: ForwardedKey = ForwardedKey(Token::from_static_unchecked("proto"));
+
+    /// Convert the `ForwardedKey` to a byte string.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl PartialEq for ForwardedKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+}
+
+impl Eq for ForwardedKey {}
+
+impl PartialOrd for ForwardedKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(::std::cmp::Ord::cmp(self, other))
+    }
+}
+
+impl Ord for ForwardedKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.ord_ignore_ascii_case(&other.0)
+    }
+}
+
 /// A setting which control how the `Forwarded` address fields are displayed.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum ForwardeeMode {
@@ -839,7 +988,7 @@ pub enum ForwardeeMode {
     Address,
 
     /// The interface should be displayed as a named interface.
-    Named(Box<str>),
+    Named(Token),
 
     /// The interface should be displayed as an unknown interface.
     Unknown,
@@ -1059,15 +1208,24 @@ mod tests {
     #[test]
     fn forwardee_display() {
         assert_eq!(
-            format!("{}", Forwardee::Address("127.0.0.1".parse().unwrap())),
-            "127.0.0.1"
+            Forwardee::Address("127.0.0.1".parse().unwrap())
+                .as_bytes()
+                .as_ref(),
+            b"127.0.0.1"
         );
         assert_eq!(
-            format!("{}", Forwardee::Address("[::1]:8080".parse().unwrap())),
-            "\"[::1]:8080\""
+            Forwardee::Address("[::1]:8080".parse().unwrap())
+                .as_bytes()
+                .as_ref(),
+            b"\"[::1]:8080\""
         );
-        assert_eq!(format!("{}", Forwardee::Unknown), "unknown");
-        assert_eq!(format!("{}", Forwardee::Named("name".into())), "_name");
+        assert_eq!(Forwardee::Unknown.as_bytes().as_ref(), b"unknown");
+        assert_eq!(
+            Forwardee::Named(Token::from_static("name"))
+                .as_bytes()
+                .as_ref(),
+            b"_name"
+        );
     }
 
     #[test]
@@ -1118,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_display() {
+    fn forwarded_bytes() {
         let forwarded = Forwarded {
             r#for: Some(Forwardee::Address(
                 "[2001:db8:cafe::17]:4711".parse().unwrap(),
@@ -1126,24 +1284,27 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(format!("{}", forwarded), "for=\"[2001:db8:cafe::17]:4711\"");
+        assert_eq!(
+            forwarded.as_bytes().as_ref(),
+            b"for=\"[2001:db8:cafe::17]:4711\""
+        );
 
         let forwarded = Forwarded {
-            r#for: Some("192.0.2.60".parse().unwrap()),
+            r#for: Some(Forwardee::Address("192.0.2.60".parse().unwrap())),
             proto: Some(ForwardProtocol::Http),
-            by: Some("203.0.113.43".parse().unwrap()),
+            by: Some(Forwardee::Address("203.0.113.43".parse().unwrap())),
             ..Default::default()
         };
 
         assert_eq!(
-            format!("{}", forwarded),
-            "by=203.0.113.43; for=192.0.2.60; proto=http"
+            forwarded.as_bytes().as_ref(),
+            b"by=203.0.113.43;for=192.0.2.60;proto=http"
         );
     }
 
     #[test]
     fn parse_forwarded_record() {
-        let forwarded = "for=192.0.2.60; proto=https"
+        let forwarded = "For=192.0.2.60; pRoTo=https"
             .parse::<ForwardedRecord>()
             .unwrap();
 
@@ -1177,7 +1338,7 @@ mod tests {
 
     #[test]
     fn parse_forwarded_chain() {
-        let forwarded = "for=192.0.2.1, for=\"[2001:db8:cafe::18]:8080\"; proto=https";
+        let forwarded = "for=192.0.2.1, for=\"[2001:db8:cafe::18]:8080\";proto=https";
         let mut request = http::Request::new(());
         request
             .headers_mut()
@@ -1224,14 +1385,12 @@ mod tests {
 
     #[test]
     fn parse_forwarded() {
-        let forwarded = "for=192.0.2.60; by=203.0.113.43; proto=http"
-            .parse()
-            .unwrap();
+        let forwarded = "for=192.0.2.60;by=203.0.113.43;proto=http".parse().unwrap();
         assert_eq!(
             Forwarded {
-                r#for: Some("192.0.2.60".parse().unwrap()),
+                r#for: Some(Forwardee::Address("192.0.2.60".parse().unwrap())),
                 proto: Some(ForwardProtocol::Http),
-                by: Some("203.0.113.43".parse().unwrap()),
+                by: Some(Forwardee::Address("203.0.113.43".parse().unwrap())),
                 ..Default::default()
             },
             forwarded
@@ -1247,7 +1406,7 @@ mod tests {
             ..Default::default()
         };
 
-        let parsed = Forwarded::from_str(&format!("{}", forwarded)).unwrap();
+        let parsed = Forwarded::parse_record(forwarded.as_bytes().as_ref()).unwrap();
         assert_eq!(parsed, forwarded);
     }
 
@@ -1298,8 +1457,8 @@ mod tests {
         assert_eq!(forwarded.proto(), None);
 
         let config = ForwardedHeaderConfig {
-            by: ForwardeeMode::Named("proxy".into()),
-            r#for: ForwardeeMode::Named("client".into()),
+            by: ForwardeeMode::Named(Token::from_static("proxy")),
+            r#for: ForwardeeMode::Named(Token::from_static("client")),
             host: true,
             proto: true,
         };
@@ -1313,8 +1472,14 @@ mod tests {
             });
         let forwarded = config.from_request(&request);
 
-        assert_eq!(forwarded.by(), Some(&Forwardee::Named("proxy".into())));
-        assert_eq!(forwarded.r#for(), Some(&Forwardee::Named("client".into())));
+        assert_eq!(
+            forwarded.by(),
+            Some(&Forwardee::Named(Token::from_static("proxy")))
+        );
+        assert_eq!(
+            forwarded.r#for(),
+            Some(&Forwardee::Named(Token::from_static("client")))
+        );
         assert_eq!(forwarded.host(), None);
         assert_eq!(forwarded.proto(), None);
     }
@@ -1358,7 +1523,7 @@ mod tests {
 
         let response = service.oneshot(request).await.unwrap();
         let forwarded = response.headers().get(FORWARDED).unwrap();
-        assert_eq!(forwarded, "for=unknown; host=example.com; proto=http");
+        assert_eq!(forwarded, "for=unknown;host=example.com;proto=http");
     }
 
     #[tokio::test]
@@ -1389,10 +1554,7 @@ mod tests {
 
             let response = service.oneshot(request).await.unwrap();
             let forwarded = response.headers().get(FORWARDED).unwrap();
-            assert_eq!(
-                forwarded,
-                "for=\"[::1]:8080\"; host=example.com; proto=https"
-            );
+            assert_eq!(forwarded, "for=\"[::1]:8080\";host=example.com;proto=https");
         }
     }
 
@@ -1417,10 +1579,7 @@ mod tests {
 
         let response = service.oneshot(request).await.unwrap();
         let forwarded = response.headers().get(FORWARDED).unwrap();
-        assert_eq!(
-            forwarded,
-            "for=\"[::1]:8080\"; host=example.com; proto=http"
-        );
+        assert_eq!(forwarded, "for=\"[::1]:8080\";host=example.com;proto=http");
 
         let x_forwarded_for = response
             .headers()
@@ -1450,7 +1609,7 @@ mod tests {
             Default::default(),
         )
         .config(ForwardedHeaderConfig {
-            r#for: ForwardeeMode::Named("example-proxy".into()),
+            r#for: ForwardeeMode::Named(Token::from_static("example-proxy")),
             ..Default::default()
         });
 
@@ -1462,10 +1621,7 @@ mod tests {
 
         let response = service.oneshot(request).await.unwrap();
         let forwarded = response.headers().get(FORWARDED).unwrap();
-        assert_eq!(
-            forwarded,
-            "for=_example-proxy; host=example.com; proto=http"
-        );
+        assert_eq!(forwarded, "for=_example-proxy;host=example.com;proto=http");
 
         assert!(
             response.headers().get(X_FORWARDED_FOR).is_none(),
@@ -1500,7 +1656,7 @@ mod tests {
             .insert(http::header::HOST, "example.com".parse().unwrap());
         request.headers_mut().insert(
             FORWARDED,
-            http::HeaderValue::from_bytes(b"not-a-valid value\xaf, for=192.0.2.5; proto=https")
+            http::HeaderValue::from_bytes(b"not-a-valid value\xaf, for=192.0.2.5;proto=https")
                 .unwrap(),
         );
         request.extensions_mut().insert(connection_info());
@@ -1511,7 +1667,7 @@ mod tests {
         assert_eq!(
             forwarded,
             http::HeaderValue::from_bytes(
-                b"not-a-valid value\xaf, for=192.0.2.5; proto=https, for=unknown; host=example.com; proto=http"
+                b"not-a-valid value\xaf, for=192.0.2.5;proto=https, for=unknown;host=example.com;proto=http"
             )
             .unwrap()
         );

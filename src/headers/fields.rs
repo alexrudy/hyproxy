@@ -11,11 +11,9 @@ use super::parser::{quoted_text, record, records, token, NoTail as _};
 
 /// Parse a header value into a sequence of field values.
 pub fn parse_header(input: &[u8], delimiter: u8) -> Result<Vec<FieldValue>, InvalidValue> {
-    let records = records(delimiter)(input)
+    records(delimiter)(input)
         .no_tail()
-        .map_err(|_| InvalidValue("header", Bytes::copy_from_slice(input)))?;
-
-    Ok(records.into_iter().map(FieldValue).collect())
+        .map_err(|_| InvalidValue("header", Bytes::copy_from_slice(input)))
 }
 
 /// Parse a field value.
@@ -23,7 +21,6 @@ pub fn parse_field(input: &[u8]) -> Result<FieldValue, InvalidValue> {
     record()(input)
         .no_tail()
         .map_err(|_| InvalidValue("field", Bytes::copy_from_slice(input)))
-        .map(FieldValue)
 }
 
 /// Parse a token.
@@ -107,6 +104,12 @@ impl FieldValue {
     }
 }
 
+impl From<Entry> for FieldValue {
+    fn from(entry: Entry) -> Self {
+        Self(entry)
+    }
+}
+
 /// A single field value component as defined by RFC-7230.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Entry {
@@ -154,6 +157,11 @@ impl Token {
         &self.0
     }
 
+    /// Convert the token into a byte buffer.
+    pub fn into_bytes(self) -> Bytes {
+        self.0
+    }
+
     /// Create a token from a static string.
     ///
     /// # Panics
@@ -162,9 +170,26 @@ impl Token {
         parse_token(s.as_bytes()).unwrap()
     }
 
+    /// Create a token from a static string without checking for invalid characters.
+    ///
+    /// # Safety
+    /// The string must contain only valid token characters, as defined in RFC-7230.
+    /// This is NOT all ASCII characters, as some are reserved for delimiters, and does
+    /// not support unicode characters.
+    pub const fn from_static_unchecked(s: &'static str) -> Self {
+        Self(Bytes::from_static(s.as_bytes()))
+    }
+
     /// Check if the token is equal to another token, ignoring ASCII case.
     pub fn eq_ignore_ascii_case(&self, other: &Self) -> bool {
         self.0.eq_ignore_ascii_case(&other.0)
+    }
+
+    /// Compare the token to another token, ignoring ASCII case.
+    pub fn ord_ignore_ascii_case(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .to_ascii_lowercase()
+            .cmp(&other.0.to_ascii_lowercase())
     }
 }
 

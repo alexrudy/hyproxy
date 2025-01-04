@@ -12,7 +12,7 @@ use nom::multi::separated_list0;
 use nom::sequence::delimited;
 use nom::{Finish, IResult, InputLength};
 
-use super::fields::{Entry, QuotedText, Token};
+use super::fields::{Entry, FieldValue, QuotedText, Token};
 
 macro_rules! byte_table {
     ($($c:expr),+ $(,)?) => {
@@ -131,11 +131,14 @@ mod test_token {
     }
 }
 
-pub(crate) fn record<'v>() -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], Entry> {
-    alt((
-        map(quoted_text, Entry::QuotedText),
-        map(token(), Entry::Token),
-    ))
+pub(crate) fn record<'v>() -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], FieldValue> {
+    map(
+        alt((
+            map(quoted_text, Entry::QuotedText),
+            map(token(), Entry::Token),
+        )),
+        Into::into,
+    )
 }
 
 pub(crate) fn strip_whitespace<'v, F, O>(parser: F) -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], O>
@@ -145,7 +148,9 @@ where
     delimited(space0, parser, space0)
 }
 
-pub(crate) fn records<'v>(delimiter: u8) -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], Vec<Entry>> {
+pub(crate) fn records<'v>(
+    delimiter: u8,
+) -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], Vec<FieldValue>> {
     let d = [delimiter];
     move |v| {
         let one_record = strip_whitespace(record());
