@@ -7,7 +7,7 @@
 //! Header chains follow the spec for [RFC 7230](https://tools.ietf.org/html/rfc7230),
 //! which defines the set of permitted and non-permitted tokens.
 
-use std::{fmt::Debug, ops, str::FromStr};
+use std::{fmt::Debug, ops};
 
 use http::HeaderMap;
 
@@ -49,16 +49,21 @@ impl<T> HeaderChain<T> {
 
 impl<T> HeaderChain<T>
 where
-    T: ParseChainRecord,
+    T: HeaderRecordKind,
 {
     /// Create a new header chain from the headers in the given headers map.
-    pub fn from_headers(name: http::HeaderName, headers: &HeaderMap) -> Self {
-        let entries = headers.get_all(&name);
+    pub fn from_headers(headers: &HeaderMap) -> Self {
+        let entries = headers.get_all(&T::HEADER_NAME);
 
         let mut inner = Vec::new();
         for entry in entries {
-            let header =
-                Header::from_header_value(entry).expect("header value to be a valid header value");
+            let header = match T::parse_header_value(entry) {
+                Ok(records) => Header::from(records),
+                Err(_) => {
+                    let raw = entry.as_bytes().to_vec();
+                    Header::single(Record::from_raw(raw))
+                }
+            };
             inner.push(header);
         }
 
@@ -256,7 +261,7 @@ mod iterchain {
 
 impl<T> HeaderChain<T>
 where
-    T: ChainRecord,
+    T: HeaderRecordKind,
 {
     /// Set the headers in the given headers map.
     pub fn set_headers(self, headers: &mut HeaderMap) {
@@ -272,7 +277,7 @@ where
         R: Into<Record<T>>,
         T: Debug,
     {
-        let mut chain = Self::from_headers(T::HEADER_NAME, headers);
+        let mut chain = Self::from_headers(headers);
         headers.remove(T::HEADER_NAME);
 
         match mode {
@@ -398,27 +403,23 @@ impl<T> Header<T> {
 
 impl<T> Header<T>
 where
-    T: ParseChainRecord,
+    T: HeaderRecordKind,
 {
-    /// Create a `Header<T>` from a header value, parsing the records.
-    pub fn from_header_value(value: &http::HeaderValue) -> Result<Self, T::Error> {
-        let value = value.as_bytes();
-        let mut records = Vec::new();
-
-        for record in value.split(|&byte| byte == T::DELIMITER) {
-            records.push(
-                Record::parse_record(record)
-                    .expect("value to parse must have been a valid HTTP header"),
-            );
-        }
-
-        Ok(Self { inner: records })
+    /// Create a new sequence of records from the given header value.
+    pub fn parse_header_value(value: &http::HeaderValue) -> Result<Self, T::Error> {
+        T::parse_header_value(value).map(|records| Header { inner: records })
     }
 }
 
 impl<T: Debug> Debug for Header<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("Headers").field(&self.inner).finish()
+    }
+}
+
+impl<T> From<Vec<Record<T>>> for Header<T> {
+    fn from(records: Vec<Record<T>>) -> Self {
+        Self { inner: records }
     }
 }
 
@@ -636,40 +637,27 @@ impl<T> Record<T> {
     }
 }
 
-impl<T> ParseChainRecord for Record<T>
+impl<T> Record<T>
 where
-    T: ParseChainRecord,
+    T: HeaderRecordKind,
 {
-    const DELIMITER: u8 = T::DELIMITER;
-    type Error = T::Error;
-
-    fn parse_record(value: &[u8]) -> Result<Self, T::Error> {
-        Ok(T::parse_record(value)
-            .map(Record::from_value)
-            .unwrap_or_else(|_| Record::from_raw(value.to_vec())))
+    fn into_bytes(self) -> Vec<u8> {
+        match self.0 {
+            RecordEntry::Value(value) => value.into_bytes(),
+            RecordEntry::Raw(value) => value,
+        }
     }
 }
 
 impl<T> From<http::HeaderValue> for Record<T>
 where
-    T: ParseChainRecord,
+    T: HeaderRecordKind,
 {
     fn from(value: http::HeaderValue) -> Self {
-        match T::parse_record(value.as_bytes()) {
-            Ok(record) => record.into(),
-            Err(_) => Record::from_raw(value.as_bytes().to_vec()),
+        match T::parse_header_value(&value) {
+            Ok(mut records) if records.len() == 1 => records.pop().unwrap(),
+            _ => Record::from_raw(value.as_bytes().to_vec()),
         }
-    }
-}
-
-impl<T> FromStr for Record<T>
-where
-    T: ParseChainRecord,
-{
-    type Err = T::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Record::parse_record(s.as_bytes())
     }
 }
 
@@ -679,33 +667,11 @@ impl<T> From<T> for Record<T> {
     }
 }
 
-impl<T> ToChainRecord for Record<T>
-where
-    T: ToChainRecord,
-{
-    const HEADER_NAME: http::header::HeaderName = T::HEADER_NAME;
-
-    fn into_bytes(self) -> Vec<u8> {
-        match self.0 {
-            RecordEntry::Value(value) => value.into_bytes(),
-            RecordEntry::Raw(value) => value,
-        }
-    }
-
-    fn into_header_value(self) -> http::HeaderValue {
-        match self.0 {
-            RecordEntry::Value(value) => value.into_header_value(),
-            RecordEntry::Raw(value) => http::HeaderValue::from_bytes(&value)
-                .expect("Records should always contain valid http Header values"),
-        }
-    }
-}
-
 /// This trait is used to convert a `Header<T>` or `HeaderChain<T>` into a
 /// http::HeaderValue.
 pub trait IntoRecordValue<T>
 where
-    T: ChainRecord,
+    T: HeaderRecordKind,
 {
     /// Convert the value into a header value.
     fn into_record_value(self) -> http::HeaderValue;
@@ -730,7 +696,7 @@ where
 impl<T, I> IntoRecordValue<T> for I
 where
     I: IntoIterator<Item = Record<T>>,
-    T: ChainRecord,
+    T: HeaderRecordKind,
 {
     fn into_record_value(self) -> http::HeaderValue {
         let records = self.into_iter().map(|record| record.into_bytes());
@@ -744,59 +710,22 @@ where
 }
 
 /// This trait is used to convert a `Record<T>` into a `http::HeaderValue`.
-pub trait ToChainRecord: Sized {
+pub trait HeaderRecordKind: Sized {
     /// The header name associated with this record.
     const HEADER_NAME: http::header::HeaderName;
+
+    /// The delimiter used to separate records in a header value.
+    const DELIMITER: u8;
+
+    /// The error type associated with this record.
+    type Error: std::error::Error;
 
     /// Convert the record into a byte representation.
     fn into_bytes(self) -> Vec<u8>;
 
-    /// Convert the record into a header value.
-    fn into_header_value(self) -> http::HeaderValue {
-        http::HeaderValue::from_bytes(&self.into_bytes())
-            .expect("Header values should always be valid HTTP header values")
-    }
-
-    /// Insert the header into the given headers map, replacing any existing headers.
-    fn insert_header(self, headers: &mut HeaderMap) {
-        headers.insert(Self::HEADER_NAME, self.into_header_value());
-    }
-
-    /// Append the header to the given headers map.
-    fn append_header(self, headers: &mut HeaderMap) {
-        headers.append(Self::HEADER_NAME, self.into_header_value());
-    }
+    /// Parse a header value into a vector of records.
+    fn parse_header_value(header: &http::HeaderValue) -> Result<Vec<Record<Self>>, Self::Error>;
 }
-
-/// This trait is used to parse a `Record<T>` from a `http::HeaderValue`.
-pub trait ParseChainRecord {
-    /// The delimiter used to separate records in a header value.
-    const DELIMITER: u8;
-
-    /// Error returned when parsing a record fails.
-    type Error: std::error::Error;
-
-    /// Parse a record from a byte representation into the record type.
-    fn parse_record(value: &[u8]) -> Result<Self, Self::Error>
-    where
-        Self: Sized;
-}
-
-/// This trait represents a typed record in a header chain.
-///
-/// It combines the `ToChainRecord` and `ParseChainRecord` traits,
-/// and is implemented for any type that implements both.
-pub trait ChainRecord: ToChainRecord + ParseChainRecord {
-    /// Create a new header chain from the headers in the given headers map.
-    fn chain_from_headers(headers: &http::HeaderMap) -> HeaderChain<Self>
-    where
-        Self: Sized,
-    {
-        HeaderChain::from_headers(Self::HEADER_NAME, headers)
-    }
-}
-
-impl<T> ChainRecord for T where T: ToChainRecord + ParseChainRecord {}
 
 /// This trait is used to convert a http::Request into a type.
 pub trait FromRequest {
