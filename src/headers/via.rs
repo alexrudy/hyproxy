@@ -2,109 +2,35 @@
 //!
 //! This header is used to identify the proxies that have been involved in the request.
 
-use core::fmt;
-use std::{net::SocketAddr, str::FromStr};
+use std::net::SocketAddr;
+use std::str::FromStr;
 
-use http::header::HeaderValue;
+use bytes::BufMut;
+use bytes::Bytes;
+use bytes::BytesMut;
+use nom::branch::alt;
+use nom::character::complete::char;
+use nom::character::complete::digit1;
+use nom::combinator::map;
+use nom::combinator::map_res;
+use nom::combinator::opt;
+use nom::multi::separated_list0;
+use nom::sequence::pair;
 use thiserror::Error;
 
-use crate::token::is_rfc7230_token;
+use crate::headers::parser::{strip_whitespace, token, NoTail};
+
+use super::chain::Record;
+use super::{
+    chain::{AppendHeaderRecordMode, HeaderChain, HeaderRecordKind},
+    fields::{InvalidValue, Token},
+};
 
 /// The `Via` header.
 pub const VIA: http::header::HeaderName = http::header::VIA;
 
 /// The `Via` header value, as a chain of proxies.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ViaChain {
-    records: Vec<Via>,
-}
-
-impl ViaChain {
-    /// Create the via header value
-    pub fn to_header_value(&self) -> HeaderValue {
-        let value = format!("{}", self);
-        value.parse().unwrap()
-    }
-
-    /// Parse the via header value from headers.
-    pub fn from_headers(headers: &http::HeaderMap) -> Result<Self, ViaError> {
-        let mut records = Vec::new();
-
-        for header in headers.get_all(VIA) {
-            let value = header.to_str().map_err(|_| ViaError::HeaderEncoding)?;
-            for record in value.split(',') {
-                records.push(record.trim().parse()?);
-            }
-        }
-
-        Ok(ViaChain { records })
-    }
-
-    /// Set the via header value in headers.
-    pub fn set_headers(&self, headers: &mut http::HeaderMap) {
-        headers.insert(VIA, self.to_header_value());
-    }
-
-    /// Get the records in the chain.
-    pub fn records(&self) -> &[Via] {
-        &self.records
-    }
-
-    /// Add a new record to the chain.
-    pub fn push(&mut self, via: Via) {
-        self.records.push(via);
-    }
-
-    /// Compress the chain by removing duplicate protocol records.
-    pub fn compress(&mut self) {
-        let mut records = Vec::new();
-        let mut last: Option<&Via> = None;
-
-        for via in self.records.iter() {
-            if let Some(last) = last {
-                if last.protocol == via.protocol {
-                    continue;
-                }
-            }
-
-            records.push(via.clone());
-            last = Some(via);
-        }
-
-        self.records = records;
-    }
-}
-
-impl fmt::Display for ViaChain {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let parts: Vec<String> = self
-            .records
-            .iter()
-            .map(|record| format!("{}", record))
-            .collect();
-
-        write!(f, "{}", parts.join(", "))
-    }
-}
-
-impl FromStr for ViaChain {
-    type Err = ViaError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let records: Vec<Via> = s
-            .split(',')
-            .map(|record| record.trim().parse())
-            .collect::<Result<Vec<Via>, ViaError>>()?;
-
-        Ok(ViaChain { records })
-    }
-}
-
-impl From<Via> for ViaChain {
-    fn from(via: Via) -> Self {
-        ViaChain { records: vec![via] }
-    }
-}
+pub type ViaChain = HeaderChain<Via>;
 
 /// The `Via` header value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,26 +39,68 @@ pub struct Via {
     address: ViaAddress,
 }
 
+fn via<'v>() -> impl FnMut(&'v [u8]) -> nom::IResult<&'v [u8], Via> {
+    use nom::sequence::pair;
+
+    map(
+        pair(protocol(), strip_whitespace(address())),
+        |(protocol, address)| Via { protocol, address },
+    )
+}
+
 impl Via {
-    /// Create the via header value
-    pub fn to_header_value(&self) -> HeaderValue {
-        let value = format!("{}", self);
-        value.parse().unwrap()
+    fn parse_bytes(value: &[u8]) -> Result<Vec<Record<Via>>, ParseViaError> {
+        let mut parser = separated_list0(char(','), strip_whitespace(via()));
+
+        parser(value)
+            .no_tail()
+            .map_err(|error| {
+                ParseViaError::ParserError(nom::error::Error::new(
+                    Bytes::copy_from_slice(error.input),
+                    error.code,
+                ))
+            })
+            .map(|r| r.into_iter().map(Into::into).collect())
     }
 }
 
-impl fmt::Display for Via {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.protocol, self.address)
+impl HeaderRecordKind for Via {
+    const HEADER_NAME: http::header::HeaderName = VIA;
+
+    const DELIMITER: u8 = b',';
+
+    type Error = ParseViaError;
+
+    fn into_bytes(self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if let Some(name) = &self.protocol.name {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'/');
+        }
+        bytes.extend_from_slice(Token::as_bytes(&self.protocol.version));
+        bytes.push(b' ');
+        bytes.extend_from_slice(self.address.into_bytes().as_ref());
+        bytes
+    }
+
+    fn parse_header_value(
+        header: &http::HeaderValue,
+    ) -> Result<Vec<super::chain::Record<Self>>, Self::Error> {
+        let value = header.as_bytes();
+        Via::parse_bytes(value)
     }
 }
 
 /// Error for an invalid Via header.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum ViaError {
+#[derive(Debug, Error)]
+pub enum ParseViaError {
     /// A part of the header is not a valid RFC 7230 token.
     #[error(transparent)]
-    InvalidToken(#[from] InvalidToken),
+    InvalidToken(#[from] InvalidValue),
+
+    /// An error occured parsing the header.
+    #[error("parsing error: {0:?}")]
+    ParserError(nom::error::Error<Bytes>),
 
     /// The header has only one (space separated) part, missing either the protocl or the address.
     #[error("Missing address, only protocol found")]
@@ -143,33 +111,45 @@ pub enum ViaError {
     HeaderEncoding,
 }
 
-impl FromStr for Via {
-    type Err = ViaError;
+/// The protocol used by the proxy.
+#[derive(Debug, Clone, Eq)]
+pub struct ViaProtocol {
+    name: Option<Token>,
+    version: Token,
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (protocol, address) = s.split_once(' ').ok_or(ViaError::MissingAddress)?;
+fn protocol<'v>() -> impl FnMut(&'v [u8]) -> nom::IResult<&'v [u8], ViaProtocol> {
+    map(
+        pair(opt(pair(strip_whitespace(token()), char('/'))), token()),
+        |(name, version)| ViaProtocol {
+            name: name.map(|(name, _)| name),
+            version,
+        },
+    )
+}
 
-        Ok(Via {
-            protocol: protocol.parse()?,
-            address: address.parse()?,
+impl ViaProtocol {
+    /// Parse a ViaProtocol from a string.
+    pub fn parse_bytes(value: &[u8]) -> Result<Self, ParseViaError> {
+        protocol()(value).no_tail().map_err(|error| {
+            ParseViaError::ParserError(nom::error::Error::new(
+                Bytes::copy_from_slice(error.input),
+                error.code,
+            ))
         })
     }
 }
 
-/// The protocol used by the proxy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ViaProtocol {
-    name: Option<String>,
-    version: String,
-}
+const HTTP: Token = Token::from_static_unchecked("HTTP");
 
-impl fmt::Display for ViaProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(name) = &self.name {
-            write!(f, "{}/{}", name, self.version)
-        } else {
-            write!(f, "{}", self.version)
-        }
+impl PartialEq for ViaProtocol {
+    fn eq(&self, other: &Self) -> bool {
+        let http = &HTTP;
+        let self_name = self.name.as_ref().unwrap_or(http);
+        let other_name = other.name.as_ref().unwrap_or(http);
+
+        self_name.eq_ignore_ascii_case(other_name)
+            && self.version.eq_ignore_ascii_case(&other.version)
     }
 }
 
@@ -177,187 +157,122 @@ impl From<http::Version> for ViaProtocol {
     fn from(version: http::Version) -> Self {
         match version {
             http::Version::HTTP_09 => ViaProtocol {
-                name: Some("HTTP".to_string()),
-                version: "0.9".to_string(),
+                name: Some(Token::from_static("HTTP")),
+                version: Token::from_static("0.9"),
             },
             http::Version::HTTP_10 => ViaProtocol {
-                name: Some("HTTP".to_string()),
-                version: "1.0".to_string(),
+                name: Some(Token::from_static("HTTP")),
+                version: Token::from_static("1.0"),
             },
             http::Version::HTTP_11 => ViaProtocol {
-                name: Some("HTTP".to_string()),
-                version: "1.1".to_string(),
+                name: Some(Token::from_static("HTTP")),
+                version: Token::from_static("1.1"),
             },
             http::Version::HTTP_2 => ViaProtocol {
-                name: Some("HTTP".to_string()),
-                version: "2".to_string(),
+                name: Some(Token::from_static("HTTP")),
+                version: Token::from_static("2"),
             },
             http::Version::HTTP_3 => ViaProtocol {
-                name: Some("HTTP".to_string()),
-                version: "3".to_string(),
+                name: Some(Token::from_static("HTTP")),
+                version: Token::from_static("3"),
             },
-            version if format!("{version:?}").contains('/') => {
-                let fmtted = format!("{version:?}");
-                let (name, version) = fmtted.split_once('/').unwrap();
-
-                if !is_rfc7230_token(name) {
-                    panic!("Invalid protocol");
-                }
-
-                if !is_rfc7230_token(version) {
-                    panic!("Invalid protocol");
-                }
-
-                ViaProtocol {
-                    name: Some(name.to_string()),
-                    version: version.to_string(),
-                }
-            }
-            version => {
-                let fmtted = format!("{version:?}");
-                if !is_rfc7230_token(&fmtted) {
-                    panic!("Invalid protocol");
-                }
-
-                ViaProtocol {
-                    name: None,
-                    version: fmtted,
-                }
-            }
+            _ => panic!("Unexpected protocol: {version:?}"),
         }
     }
 }
 
-/// Error for invalid protocol.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("Invalid token: {0}")]
-pub struct InvalidToken(String);
-
-impl FromStr for ViaProtocol {
-    type Err = InvalidToken;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some((name, version)) = s.split_once('/') {
-            if !is_rfc7230_token(name) {
-                return Err(InvalidToken(name.to_string()));
-            }
-
-            if !is_rfc7230_token(version) {
-                return Err(InvalidToken(version.to_string()));
-            }
-
-            Ok(ViaProtocol {
-                name: Some(name.to_string()),
-                version: version.to_string(),
+fn address<'v>() -> impl FnMut(&'v [u8]) -> nom::IResult<&'v [u8], ViaAddress> {
+    let port = map_res(pair(char::<&[u8], _>(':'), digit1), |(_, port)| {
+        std::str::from_utf8(port)
+            .map_err(|_| nom::error::Error::new(port, nom::error::ErrorKind::Digit))
+            .and_then(|s| {
+                s.parse::<u16>()
+                    .map_err(|_| nom::error::Error::new(port, nom::error::ErrorKind::Digit))
             })
-        } else {
-            if !is_rfc7230_token(s) {
-                return Err(InvalidToken(s.to_string()));
-            }
-            Ok(ViaProtocol {
-                name: None,
-                version: s.to_string(),
-            })
-        }
-    }
+    });
+
+    let address = map(pair(token(), port), |(host, port)| {
+        ViaAddress::HostAndPort(host, Some(port))
+    });
+    let pseudonym = map(token(), ViaAddress::Pseudonym);
+
+    strip_whitespace(alt((address, pseudonym)))
 }
 
 /// The name or address of the proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViaAddress {
     /// The host and port of the proxy.
-    HostAndPort(http::uri::Authority),
+    HostAndPort(Token, Option<u16>),
 
     /// A pseudonym for the proxy.
-    Pseudonym(Box<str>),
+    Pseudonym(Token),
 }
 
 impl ViaAddress {
-    /// Create a ViaAddress from a name/psuedonym.
-    pub fn named(name: impl Into<String>) -> Result<Self, InvalidToken> {
-        let value: String = name.into();
-        if is_rfc7230_token(&value) {
-            Ok(ViaAddress::Pseudonym(value.into()))
-        } else {
-            Err(InvalidToken(value))
+    /// Convert the ViaAddress to a byte representation suitable for inclusion in a HTTP header.
+    pub fn into_bytes(self) -> Bytes {
+        match self {
+            ViaAddress::HostAndPort(host, Some(port)) => {
+                let mut bytes = host
+                    .into_bytes()
+                    .try_into_mut()
+                    .unwrap_or_else(|b| BytesMut::from(b.as_ref()));
+                bytes.put_u8(b':');
+                bytes.extend_from_slice(port.to_string().as_bytes());
+                bytes.freeze()
+            }
+            ViaAddress::HostAndPort(host, None) => host.into_bytes(),
+            ViaAddress::Pseudonym(name) => name.into_bytes(),
         }
+    }
+
+    /// Parse a ViaAddress from a sequence of HTTP header bytes.
+    pub fn parse_bytes(value: &[u8]) -> Result<Self, ParseViaError> {
+        address()(value).no_tail().map_err(|error| {
+            ParseViaError::ParserError(nom::error::Error::new(
+                Bytes::copy_from_slice(error.input),
+                error.code,
+            ))
+        })
+    }
+
+    /// Create a ViaAddress from a name/psuedonym.
+    pub fn named(name: impl Into<String>) -> Result<Self, InvalidValue> {
+        let name = Token::parse(name.into().as_bytes())?;
+        Ok(ViaAddress::Pseudonym(name))
     }
 
     /// Create a ViaAddress from a URI.
-    pub fn from_uri(uri: &http::Uri) -> Option<Self> {
-        uri.authority().cloned().map(ViaAddress::HostAndPort)
+    pub fn from_uri(uri: &http::Uri) -> Result<Option<Self>, InvalidValue> {
+        let authority = uri.authority();
+        if let Some(authority) = authority {
+            let host = authority.host();
+            let port = authority.port_u16();
+            return Ok(Some(ViaAddress::HostAndPort(
+                Token::parse(host.as_bytes())?,
+                port,
+            )));
+        }
+
+        Ok(None)
     }
 }
 
-impl fmt::Display for ViaAddress {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ViaAddress::HostAndPort(authority) => write!(f, "{}", authority),
-            ViaAddress::Pseudonym(pseudonym) => write!(f, "{}", pseudonym),
-        }
+impl FromStr for ViaAddress {
+    type Err = ParseViaError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ViaAddress::parse_bytes(s.as_bytes())
     }
 }
 
 impl From<SocketAddr> for ViaAddress {
     fn from(addr: SocketAddr) -> Self {
-        ViaAddress::HostAndPort(http::uri::Authority::try_from(format!("{}", addr)).unwrap())
-    }
-}
-
-impl FromStr for ViaAddress {
-    type Err = InvalidToken;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.contains(':') {
-            if let Ok(addr) = s.parse() {
-                return Ok(ViaAddress::HostAndPort(addr));
-            }
-        }
-
-        if is_rfc7230_token(s) {
-            Ok(ViaAddress::Pseudonym(s.into()))
-        } else {
-            Err(InvalidToken(s.to_string()))
-        }
-    }
-}
-
-/// Middleware modes for the Via header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum ViaHeaderMode {
-    /// Do not set the Via header. Ignore any existing Via header.
-    Omit,
-    /// Replace the existing Via header.
-    Replace,
-
-    /// Chain the value to the existing Via header.
-    #[default]
-    Chain,
-
-    /// Append the value as a new Via header.
-    Append,
-}
-
-impl ViaHeaderMode {
-    fn is_omit(&self) -> bool {
-        matches!(self, ViaHeaderMode::Omit)
-    }
-
-    fn apply(&self, headers: &mut http::HeaderMap, via: Via) {
-        match self {
-            ViaHeaderMode::Replace => {
-                headers.insert(VIA, via.to_header_value());
-            }
-            ViaHeaderMode::Chain => {
-                let mut chain = ViaChain::from_headers(headers).unwrap_or_default();
-                chain.push(via);
-                chain.set_headers(headers);
-            }
-            ViaHeaderMode::Append => {
-                headers.append(VIA, via.to_header_value());
-            }
-            _ => {}
-        }
+        ViaAddress::HostAndPort(
+            Token::parse(addr.ip().to_string().as_bytes()).unwrap(),
+            Some(addr.port()),
+        )
     }
 }
 
@@ -365,8 +280,8 @@ impl ViaHeaderMode {
 #[derive(Debug, Clone)]
 pub struct SetViaHeaderLayer {
     address: ViaAddress,
-    request: ViaHeaderMode,
-    response: ViaHeaderMode,
+    request: AppendHeaderRecordMode,
+    response: AppendHeaderRecordMode,
 }
 
 impl SetViaHeaderLayer {
@@ -380,13 +295,13 @@ impl SetViaHeaderLayer {
     }
 
     /// Set whether to add the Via header to requests.
-    pub fn request(mut self, request: ViaHeaderMode) -> Self {
+    pub fn request(mut self, request: AppendHeaderRecordMode) -> Self {
         self.request = request;
         self
     }
 
     /// Set whether to add the Via header to responses.
-    pub fn response(mut self, response: ViaHeaderMode) -> Self {
+    pub fn response(mut self, response: AppendHeaderRecordMode) -> Self {
         self.response = response;
         self
     }
@@ -399,8 +314,8 @@ impl<S> tower::layer::Layer<S> for SetViaHeaderLayer {
         SetViaHeader {
             inner,
             address: self.address.clone(),
-            request: self.request,
-            response: self.response,
+            request: self.request.clone(),
+            response: self.response.clone(),
         }
     }
 }
@@ -410,8 +325,8 @@ impl<S> tower::layer::Layer<S> for SetViaHeaderLayer {
 pub struct SetViaHeader<S> {
     inner: S,
     address: ViaAddress,
-    request: ViaHeaderMode,
-    response: ViaHeaderMode,
+    request: AppendHeaderRecordMode,
+    response: AppendHeaderRecordMode,
 }
 
 impl<S> SetViaHeader<S> {
@@ -426,12 +341,12 @@ impl<S> SetViaHeader<S> {
     }
 
     /// A mutable reference to the request VIA header mode.
-    pub fn request(&mut self) -> &mut ViaHeaderMode {
+    pub fn request(&mut self) -> &mut AppendHeaderRecordMode {
         &mut self.request
     }
 
     /// A mutable reference to the response VIA header mode.
-    pub fn response(&mut self) -> &mut ViaHeaderMode {
+    pub fn response(&mut self) -> &mut AppendHeaderRecordMode {
         &mut self.response
     }
 }
@@ -445,19 +360,17 @@ where
     type Future = self::future::ViaHeaderFuture<S::Future, BOut, S::Error>;
 
     fn call(&mut self, mut request: http::Request<BIn>) -> Self::Future {
-        if !self.request.is_omit() {
-            let via = Via {
-                protocol: request.version().into(),
-                address: self.address.clone(),
-            };
+        let via = Via {
+            protocol: request.version().into(),
+            address: self.address.clone(),
+        };
 
-            self.request.apply(request.headers_mut(), via);
-        }
+        ViaChain::append_record(&self.request, via, request.headers_mut());
 
         self::future::ViaHeaderFuture::new(
             self.inner.call(request),
             self.address.clone(),
-            self.response,
+            self.response.clone(),
         )
     }
 
@@ -474,7 +387,9 @@ mod future {
 
     use pin_project_lite::pin_project;
 
-    use super::{Via, ViaAddress, ViaHeaderMode};
+    use crate::headers::chain::{AppendHeaderRecordMode, HeaderChain};
+
+    use super::{Via, ViaAddress};
 
     pin_project! {
         #[derive(Debug)]
@@ -482,13 +397,13 @@ mod future {
             #[pin]
             inner: F,
             address: ViaAddress,
-            mode: ViaHeaderMode,
+            mode: AppendHeaderRecordMode,
             marker: std::marker::PhantomData<fn() -> Result<BOut, E>>,
         }
     }
 
     impl<F, BOut, E> ViaHeaderFuture<F, BOut, E> {
-        pub(super) fn new(inner: F, address: ViaAddress, mode: ViaHeaderMode) -> Self {
+        pub(super) fn new(inner: F, address: ViaAddress, mode: AppendHeaderRecordMode) -> Self {
             Self {
                 inner,
                 address,
@@ -512,14 +427,12 @@ mod future {
             let mut response = ready!(this.inner.poll(cx));
 
             if let Ok(res) = &mut response {
-                if !this.mode.is_omit() {
-                    let via = Via {
-                        protocol: res.version().into(),
-                        address: this.address.clone(),
-                    };
+                let via = Via {
+                    protocol: res.version().into(),
+                    address: this.address.clone(),
+                };
 
-                    this.mode.apply(res.headers_mut(), via);
-                }
+                HeaderChain::append_record(this.mode, via, res.headers_mut());
             }
 
             std::task::Poll::Ready(response)
@@ -529,190 +442,187 @@ mod future {
 
 #[cfg(test)]
 mod tests {
+    use std::{convert::Infallible, future::Future, pin::Pin};
+
     use tower::{Layer as _, ServiceExt as _};
+
+    use crate::headers::chain::{Header, IntoRecordValue};
 
     use super::*;
 
     #[test]
-    fn parse_via_protocol() {
+    fn via_address_named() {
         assert_eq!(
-            ViaProtocol {
-                name: Some("http".into()),
-                version: "1.1".into()
-            },
-            "http/1.1".parse().unwrap()
+            ViaAddress::Pseudonym(Token::from_static("proxy")),
+            ViaAddress::named("proxy").unwrap()
         );
 
-        assert_eq!(
-            ViaProtocol {
-                name: None,
-                version: "1.1".into()
-            },
-            "1.1".parse().unwrap()
+        assert!(
+            ViaAddress::named("😀").is_err(),
+            "Invalid characters in pseudonym"
         );
     }
 
-    #[test]
-    fn version_to_protocol() {
-        assert_eq!(
-            ViaProtocol {
-                name: Some("HTTP".into()),
-                version: "1.1".into()
-            },
-            http::Version::HTTP_11.into()
-        );
-
-        assert_eq!(
-            ViaProtocol {
-                name: Some("HTTP".into()),
-                version: "2".into()
-            },
-            http::Version::HTTP_2.into()
-        );
-    }
-
-    #[test]
-    fn invalid_protocol() {
-        assert!("http/,1".parse::<ViaProtocol>().is_err());
-        assert!("😀".parse::<ViaProtocol>().is_err());
-    }
-
-    #[test]
-    fn display_protocol() {
-        assert_eq!(
-            "http/1.1",
-            format!("{}", "http/1.1".parse::<ViaProtocol>().unwrap())
-        );
-        assert_eq!("1.1", format!("{}", "1.1".parse::<ViaProtocol>().unwrap()));
-    }
-
-    #[test]
-    fn parse_via_address() {
-        assert_eq!(
-            ViaAddress::HostAndPort("localhost:8080".parse().unwrap()),
-            "localhost:8080".parse().unwrap()
-        );
-
-        assert_eq!(
-            ViaAddress::Pseudonym("proxy".into()),
-            "proxy".parse().unwrap()
-        );
-    }
-
-    #[test]
-    fn invalid_address() {
-        assert!("😀".parse::<ViaAddress>().is_err());
-    }
-
-    #[test]
-    fn display_address() {
-        assert_eq!(
-            "localhost:8080",
-            format!("{}", "localhost:8080".parse::<ViaAddress>().unwrap())
-        );
-        assert_eq!(
-            "proxy",
-            format!("{}", "proxy".parse::<ViaAddress>().unwrap())
-        );
+    macro_rules! parse_one {
+        ($value:expr) => {
+            Via::parse_bytes($value)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .into_value()
+                .unwrap()
+        };
     }
 
     #[test]
     fn parse_via() {
+        let addr = parse_one!(b"http/1.1 localhost:8080");
+
         assert_eq!(
+            addr,
             Via {
-                protocol: "http/1.1".parse().unwrap(),
-                address: "localhost:8080".parse().unwrap()
-            },
-            "http/1.1 localhost:8080".parse().unwrap()
+                protocol: http::Version::HTTP_11.into(),
+                address: ViaAddress::HostAndPort(Token::from_static("localhost"), Some(8080))
+            }
         );
 
+        let addr = parse_one!(b"http/1.1 proxy");
+
         assert_eq!(
+            addr,
             Via {
-                protocol: "http/1.1".parse().unwrap(),
-                address: "proxy".parse().unwrap()
-            },
-            "http/1.1 proxy".parse().unwrap()
+                protocol: http::Version::HTTP_11.into(),
+                address: ViaAddress::named("proxy").unwrap(),
+            }
         );
     }
 
     #[test]
-    fn invalid_via() {
-        assert!("http/1.1, localhost:8080".parse::<Via>().is_err());
-        assert!("http/1.1".parse::<Via>().is_err());
-        assert!("😀".parse::<Via>().is_err());
+    fn parse_via_records() {
+        let records = Via::parse_bytes(b"http/1.1 localhost:8080, http/1.1 proxy").unwrap();
+
+        assert_eq!(2, records.len());
+
+        assert_eq!(
+            records[0].value().unwrap(),
+            &Via {
+                protocol: http::Version::HTTP_11.into(),
+                address: ViaAddress::HostAndPort(Token::from_static("localhost"), Some(8080))
+            }
+        );
+
+        assert_eq!(
+            records[1].value().unwrap(),
+            &Via {
+                protocol: http::Version::HTTP_11.into(),
+                address: ViaAddress::named("proxy").unwrap(),
+            }
+        );
+
+        let records = Via::parse_bytes(b"1.1 vegur").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].value().unwrap(),
+            &Via {
+                protocol: http::Version::HTTP_11.into(),
+                address: ViaAddress::named("vegur").unwrap(),
+            }
+        );
+
+        let records = Via::parse_bytes(b"1.0 fred, 1.1 p.example.net").unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].value().unwrap(),
+            &Via {
+                protocol: http::Version::HTTP_10.into(),
+                address: ViaAddress::named("fred").unwrap(),
+            }
+        );
+
+        assert_eq!(
+            records[1].value().unwrap(),
+            &Via {
+                protocol: http::Version::HTTP_11.into(),
+                address: ViaAddress::named("p.example.net").unwrap(),
+            }
+        );
+
+        let records = Via::parse_bytes(b"HTTP/1.1 GWA").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].value().unwrap(),
+            &Via {
+                protocol: http::Version::HTTP_11.into(),
+                address: ViaAddress::named("GWA").unwrap(),
+            }
+        );
     }
 
-    #[test]
-    fn display_via() {
-        assert_eq!(
-            "http/1.1 localhost:8080",
-            format!("{}", "http/1.1 localhost:8080".parse::<Via>().unwrap())
-        );
-        assert_eq!(
-            "http/1.1 proxy",
-            format!("{}", "http/1.1 proxy".parse::<Via>().unwrap())
-        );
+    fn via_fixture() -> Via {
+        Via {
+            protocol: http::Version::HTTP_11.into(),
+            address: ViaAddress::HostAndPort(Token::from_static("localhost"), Some(8080)),
+        }
     }
 
-    #[test]
-    fn parse_via_chain() {
-        assert_eq!(
-            ViaChain {
-                records: vec![
-                    "http/1.1 localhost:8080".parse().unwrap(),
-                    "http/1.1 proxy".parse().unwrap()
-                ]
-            },
-            "http/1.1 localhost:8080, http/1.1 proxy".parse().unwrap()
-        );
+    type BoxServiceFuture = Pin<Box<dyn Future<Output = Result<http::Response<()>, Infallible>>>>;
+
+    fn via_service(via: Option<Via>) -> impl FnMut(http::Request<()>) -> BoxServiceFuture {
+        move |request: http::Request<()>| {
+            let via = via.clone();
+            Box::pin(async move {
+                let header = if let Some(via) = via {
+                    let header = Header::single(via.clone());
+
+                    assert_eq!(
+                        header.clone().into_header_value(),
+                        request.headers().get(VIA).unwrap()
+                    );
+
+                    header
+                } else {
+                    Header::new()
+                };
+
+                Ok(http::Response::builder()
+                    .header(VIA, header.into_header_value())
+                    .body(())
+                    .unwrap())
+            })
+        }
     }
 
     #[tokio::test]
     async fn via_header_middleware_defaults() {
-        let middleware = SetViaHeaderLayer::new("localhost:8080".parse().unwrap());
-        let service = middleware.layer(tower::service_fn(|req: http::Request<()>| async move {
-            let via = Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: "localhost:8080".parse().unwrap(),
-            };
-            assert_eq!(via.to_header_value(), req.headers().get(VIA).unwrap());
-            http::Response::builder()
-                .header(VIA, via.to_header_value())
-                .body(())
-        }));
+        let addr = ViaAddress::from_uri(&"https://localhost:8080".parse().unwrap())
+            .unwrap()
+            .unwrap();
+        let middleware = SetViaHeaderLayer::new(addr.clone());
+        let service = middleware.layer(tower::service_fn(via_service(Some(via_fixture()))));
 
         let request = http::Request::new(());
         let response = service.oneshot(request).await.unwrap();
 
         let via = Via {
             protocol: http::Version::HTTP_11.into(),
-            address: "localhost:8080".parse().unwrap(),
+            address: addr.clone(),
         };
 
-        let chain: ViaChain = ViaChain::from_headers(response.headers()).unwrap();
+        let chain: ViaChain = ViaChain::from_headers(response.headers());
 
-        assert_eq!(2, chain.records().len());
+        assert_eq!(2, chain.len());
 
         assert!(
-            chain.records.iter().all(|v| v == &via),
+            chain.flat_iter().all(|v| v.value().unwrap() == &via),
             "All records are the same VIA"
-        )
+        );
     }
 
     #[tokio::test]
     async fn via_header_middleware_append() {
         let middleware = SetViaHeaderLayer::new("localhost:8080".parse().unwrap())
-            .response(ViaHeaderMode::Append);
-        let service = middleware.layer(tower::service_fn(|req: http::Request<()>| async move {
-            let via = Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: "localhost:8080".parse().unwrap(),
-            };
-            assert_eq!(via.to_header_value(), req.headers().get(VIA).unwrap());
-            http::Response::builder()
-                .header(VIA, via.to_header_value())
-                .body(())
-        }));
+            .response(AppendHeaderRecordMode::Append);
+        let service = middleware.layer(tower::service_fn(via_service(Some(via_fixture()))));
 
         let request = http::Request::new(());
         let response = service.oneshot(request).await.unwrap();
@@ -722,12 +632,12 @@ mod tests {
             address: "localhost:8080".parse().unwrap(),
         };
 
-        let chain: ViaChain = ViaChain::from_headers(response.headers()).unwrap();
+        let chain: ViaChain = ViaChain::from_headers(response.headers());
 
-        assert_eq!(2, chain.records().len());
+        assert_eq!(2, chain.len());
 
         assert!(
-            chain.records.iter().all(|v| v == &via),
+            chain.flat_iter().all(|v| v.value() == Some(&via)),
             "All records are the same VIA"
         );
 
@@ -737,19 +647,13 @@ mod tests {
     #[tokio::test]
     async fn via_header_middleware_replace() {
         let middleware = SetViaHeaderLayer::new("localhost:8080".parse().unwrap())
-            .response(ViaHeaderMode::Replace);
-        let service = middleware.layer(tower::service_fn(|req: http::Request<()>| async move {
-            let via = Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: "localhost:8080".parse().unwrap(),
-            };
-            assert_eq!(via.to_header_value(), req.headers().get(VIA).unwrap());
-            http::Response::builder()
-                .header(VIA, via.to_header_value())
-                .body(())
-        }));
+            .response(AppendHeaderRecordMode::KeepLast);
+        let service = middleware.layer(tower::service_fn(via_service(None)));
 
-        let request = http::Request::new(());
+        let request = http::Request::get("http://localhost:8080")
+            .header(VIA, "1.1 foo")
+            .body(())
+            .unwrap();
         let response = service.oneshot(request).await.unwrap();
 
         let via = Via {
@@ -757,41 +661,28 @@ mod tests {
             address: "localhost:8080".parse().unwrap(),
         };
 
-        let chain: ViaChain = ViaChain::from_headers(response.headers()).unwrap();
+        let chain: ViaChain = ViaChain::from_headers(response.headers());
 
-        assert_eq!(1, chain.records().len());
+        assert_eq!(1, chain.flat_iter().count());
 
-        assert_eq!(via, chain.records()[0]);
+        assert_eq!(
+            &via,
+            chain.flat_into_iter().next().unwrap().value().unwrap()
+        );
     }
 
     #[tokio::test]
     async fn via_header_middleware_omit() {
         let middleware = SetViaHeaderLayer::new("localhost:8080".parse().unwrap())
-            .response(ViaHeaderMode::Omit)
-            .request(ViaHeaderMode::Omit);
-        let service = middleware.layer(tower::service_fn(|req: http::Request<()>| async move {
-            let via = Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: "localhost:8081".parse().unwrap(),
-            };
-            assert!(req.headers().get(VIA).is_none());
-            http::Response::builder()
-                .header(VIA, via.to_header_value())
-                .body(())
-        }));
+            .response(AppendHeaderRecordMode::Omit)
+            .request(AppendHeaderRecordMode::Omit);
+        let service = middleware.layer(tower::service_fn(via_service(None)));
 
         let request = http::Request::new(());
         let response = service.oneshot(request).await.unwrap();
 
-        let via = Via {
-            protocol: http::Version::HTTP_11.into(),
-            address: "localhost:8081".parse().unwrap(),
-        };
+        let chain: ViaChain = ViaChain::from_headers(response.headers());
 
-        let chain: ViaChain = ViaChain::from_headers(response.headers()).unwrap();
-
-        assert_eq!(1, chain.records().len());
-
-        assert_eq!(via, chain.records()[0]);
+        assert!(chain.is_empty());
     }
 }
