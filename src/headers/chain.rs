@@ -266,7 +266,7 @@ where
     /// Set the headers in the given headers map.
     pub fn set_headers(self, headers: &mut HeaderMap) {
         for header in self.into_iter() {
-            let value = header.into_record_value();
+            let value = header.into_header_value();
             headers.append(T::HEADER_NAME, value);
         }
     }
@@ -306,6 +306,7 @@ where
                 chain.push_header(Header::single(record));
                 chain.keep_first().set_headers(headers);
             }
+            AppendHeaderRecordMode::Omit => {}
         }
     }
 }
@@ -674,14 +675,14 @@ where
     T: HeaderRecordKind,
 {
     /// Convert the value into a header value.
-    fn into_record_value(self) -> http::HeaderValue;
+    fn into_header_value(self) -> http::HeaderValue;
 
     /// Insert the header into the given headers map, replacing any existing headers.
     fn insert_header(self, headers: &mut HeaderMap) -> Option<http::HeaderValue>
     where
         Self: Sized,
     {
-        headers.insert(T::HEADER_NAME, self.into_record_value())
+        headers.insert(T::HEADER_NAME, self.into_header_value())
     }
 
     /// Append the header to the given headers map.
@@ -689,7 +690,7 @@ where
     where
         Self: Sized,
     {
-        headers.append(T::HEADER_NAME, self.into_record_value())
+        headers.append(T::HEADER_NAME, self.into_header_value())
     }
 }
 
@@ -698,7 +699,7 @@ where
     I: IntoIterator<Item = Record<T>>,
     T: HeaderRecordKind,
 {
-    fn into_record_value(self) -> http::HeaderValue {
+    fn into_header_value(self) -> http::HeaderValue {
         let records = self.into_iter().map(|record| record.into_bytes());
         http::HeaderValue::from_bytes(
             &records
@@ -758,4 +759,7 @@ pub enum AppendHeaderRecordMode {
     /// Keep only the first header in the chain, or if there are no headers, create a new header with
     /// the new record.
     KeepFirst,
+
+    /// Remove the header from the headers map.
+    Omit,
 }

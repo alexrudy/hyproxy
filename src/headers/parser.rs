@@ -12,7 +12,7 @@ use nom::multi::separated_list0;
 use nom::sequence::delimited;
 use nom::{Finish, IResult, InputLength};
 
-use super::fields::{Entry, FieldValue, QuotedText, Token};
+use super::fields::{Entry, FieldKey, FieldValue, QuotedText, Token};
 
 macro_rules! byte_table {
     ($($c:expr),+ $(,)?) => {
@@ -109,6 +109,10 @@ pub(crate) fn token<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Token> {
     map(take_while1(is_token), |t: &[u8]| {
         Token::new(Bytes::copy_from_slice(t))
     })
+}
+
+pub(crate) fn key<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], FieldKey> {
+    map(token(), FieldKey::new)
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use hyperdriver::info::ConnectionInfo;
 use nom::Finish;
 use thiserror::Error;
 
-use super::fields::{FieldValue, Token};
+use super::fields::{FieldKey, FieldValue, Token};
 
 use super::chain::{
     AppendHeaderRecordMode, FromRequest, Header, HeaderChain, HeaderRecordKind, Record,
@@ -327,18 +327,19 @@ mod parse {
     use nom::sequence::separated_pair;
     use nom::IResult;
 
-    use crate::headers::fields::{FieldValue, Token};
-    use crate::headers::parser::{record, strip_whitespace, token};
+    use crate::headers::fields::{FieldKey, FieldValue};
+    use crate::headers::parser::{key, record, strip_whitespace};
 
-    fn forwarded_key_value<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], (Token, FieldValue)> {
+    fn forwarded_key_value<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], (FieldKey, FieldValue)>
+    {
         separated_pair(
-            strip_whitespace(token()),
+            strip_whitespace(key()),
             char('='),
             strip_whitespace(record()),
         )
     }
 
-    pub type ForwardedRecord = Vec<(Token, FieldValue)>;
+    pub type ForwardedRecord = Vec<(FieldKey, FieldValue)>;
 
     pub(super) fn forwarded_record<'a>(
     ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], ForwardedRecord> {
@@ -371,7 +372,7 @@ impl Forwarded {
 
     fn parse_items<I>(iter: I) -> Result<Forwarded, ParseForwardedError>
     where
-        I: IntoIterator<Item = (Token, FieldValue)>,
+        I: IntoIterator<Item = (FieldKey, FieldValue)>,
     {
         let mut data: BTreeMap<_, _> = BTreeMap::new();
 
@@ -944,45 +945,30 @@ impl XForwardedHost<'_> {
 }
 
 /// A key used in a `Forwarded` header.
-#[derive(Debug, Clone)]
-pub struct ForwardedKey(Token);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ForwardedKey(FieldKey);
 
 impl ForwardedKey {
     /// The interface where the request came in to the proxy server.
-    pub const BY: ForwardedKey = ForwardedKey(Token::from_static_unchecked("by"));
+    pub const BY: ForwardedKey = ForwardedKey::new(Token::from_static_unchecked("by"));
 
     /// The client that initiated the request and subsequent proxies in a chain of proxies.
-    pub const FOR: ForwardedKey = ForwardedKey(Token::from_static_unchecked("for"));
+    pub const FOR: ForwardedKey = ForwardedKey::new(Token::from_static_unchecked("for"));
 
     /// The `host` request header field as received by the proxy.
-    pub const HOST: ForwardedKey = ForwardedKey(Token::from_static_unchecked("host"));
+    pub const HOST: ForwardedKey = ForwardedKey::new(Token::from_static_unchecked("host"));
 
     /// Indicates which protocol was used to make the request (typically "http" or "https").
-    pub const PROTO: ForwardedKey = ForwardedKey(Token::from_static_unchecked("proto"));
+    pub const PROTO: ForwardedKey = ForwardedKey::new(Token::from_static_unchecked("proto"));
 
     /// Convert the `ForwardedKey` to a byte string.
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
-}
 
-impl PartialEq for ForwardedKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.eq_ignore_ascii_case(&other.0)
-    }
-}
-
-impl Eq for ForwardedKey {}
-
-impl PartialOrd for ForwardedKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(::std::cmp::Ord::cmp(self, other))
-    }
-}
-
-impl Ord for ForwardedKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.ord_ignore_ascii_case(&other.0)
+    /// Create a new `ForwardedKey`.
+    pub const fn new(token: Token) -> Self {
+        Self(FieldKey::new(token))
     }
 }
 

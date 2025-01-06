@@ -120,6 +120,58 @@ pub enum Entry {
     QuotedText(QuotedText),
 }
 
+/// The key portion of key-value pair in a header field.
+#[derive(Debug, Clone)]
+pub struct FieldKey(Token);
+
+impl FieldKey {
+    /// Create a new field key from a token.
+    pub const fn new(token: Token) -> Self {
+        Self(token)
+    }
+
+    /// Get the field key as a byte slice.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// Convert the field key into a byte buffer.
+    pub fn into_bytes(self) -> Bytes {
+        self.0.into_bytes()
+    }
+
+    /// Turn into the inner token.
+    pub fn into_token(self) -> Token {
+        self.0
+    }
+}
+
+impl PartialEq for FieldKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
+}
+
+impl Eq for FieldKey {}
+
+impl PartialOrd for FieldKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(::std::cmp::Ord::cmp(self, other))
+    }
+}
+
+impl Ord for FieldKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.ord_ignore_ascii_case(&other.0)
+    }
+}
+
+impl From<Token> for FieldKey {
+    fn from(token: Token) -> Self {
+        Self(token)
+    }
+}
+
 /// An error indicating that a value was invalid.
 #[derive(Debug, Error)]
 pub struct InvalidValue(&'static str, Bytes);
@@ -168,6 +220,11 @@ impl Token {
     /// If the string contains invalid token characters.
     pub fn from_static(s: &'static str) -> Self {
         parse_token(s.as_bytes()).unwrap()
+    }
+
+    /// Parse a token from a byte slice.
+    pub fn parse(b: &[u8]) -> Result<Self, InvalidValue> {
+        parse_token(b)
     }
 
     /// Create a token from a static string without checking for invalid characters.
