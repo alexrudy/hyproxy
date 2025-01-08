@@ -1,6 +1,7 @@
 //! Proxy headers management.
 
 pub mod chain;
+pub mod connection;
 pub mod fields;
 pub mod forward;
 pub mod hopby;
