@@ -8,3 +8,4 @@
 
 pub mod headers;
 pub mod upgrade;
+pub mod uri;
