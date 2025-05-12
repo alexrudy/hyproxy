@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bailout_service_creation() {
+    async fn bailout_service_creation() {
         let inner_service = MockService::new(true, 5);
         let preprocessor = |req: TestRequest| Ok::<_, Infallible>(req);
 
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bailout_service_pass_through() {
+    async fn bailout_service_pass_through() {
         let inner_service = MockService::new(true, 5);
         let preprocessor = |req: TestRequest| Ok(req);
 
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bailout_service_bail_out() {
+    async fn bailout_service_bail_out() {
         let inner_service = MockService::new(true, 5);
         let bailout_response = TestResponse { value: 42 };
         let preprocessor = move |_req: TestRequest| -> Result<TestRequest, TestResponse> {
@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bailout_layer() {
+    async fn bailout_layer() {
         let inner_service = MockService::new(true, 5);
         let preprocessor = |req: TestRequest| Ok(req);
 
@@ -328,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_debug_impl() {
+    fn debug_impl() {
         let inner_service = MockService::new(true, 5);
         let preprocessor = |req: TestRequest| Ok::<_, Infallible>(req);
 
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bailout_future() {
+    async fn bailout_future() {
         use super::future::BailFuture;
 
         // Test the future case
@@ -364,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn test_service_not_ready() {
+    fn service_not_ready() {
         let inner_service = MockService::new(false, 5); // Not ready
         let preprocessor = |req: TestRequest| Ok(req);
 
@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complex_preprocessor() {
+    async fn complex_preprocessor() {
         let inner_service = MockService::new(true, 5);
 
         // A preprocessor that conditionally bails or modifies the request
