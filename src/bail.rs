@@ -260,58 +260,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bailout_service_creation() {
+    async fn bail_service_creation() {
         let inner_service = MockService::new(true, 5);
         let preprocessor = |req: TestRequest| Ok::<_, Infallible>(req);
 
-        let bailout_service = BailService::new(inner_service, preprocessor);
-        assert!(std::matches!(bailout_service.service(), MockService { .. }));
+        let bail_service = BailService::new(inner_service, preprocessor);
+        assert!(std::matches!(bail_service.service(), MockService { .. }));
     }
 
     #[tokio::test]
-    async fn bailout_service_pass_through() {
+    async fn bail_service_pass_through() {
         let inner_service = MockService::new(true, 5);
         let preprocessor = |req: TestRequest| Ok(req);
 
-        let mut bailout_service = BailService::new(inner_service, preprocessor);
+        let mut bail_service = BailService::new(inner_service, preprocessor);
 
         // Test poll_ready
-        let poll_result = poll_once(|cx| bailout_service.poll_ready(cx));
+        let poll_result = poll_once(|cx| bail_service.poll_ready(cx));
         assert_eq!(poll_result, Poll::Ready(Ok(())));
 
         // Test call with pass-through
         let request = TestRequest { value: 10 };
-        let response_future = bailout_service.call(request);
+        let response_future = bail_service.call(request);
 
         let response = response_future.await.unwrap();
         assert_eq!(response, TestResponse { value: 15 }); // 10 + 5
     }
 
     #[tokio::test]
-    async fn bailout_service_bail_out() {
+    async fn bail_service_bail_out() {
         let inner_service = MockService::new(true, 5);
-        let bailout_response = TestResponse { value: 42 };
+        let bail_response = TestResponse { value: 42 };
         let preprocessor = move |_req: TestRequest| -> Result<TestRequest, TestResponse> {
-            Err(bailout_response.clone())
+            Err(bail_response.clone())
         };
 
-        let mut bailout_service = BailService::new(inner_service, preprocessor);
+        let mut bail_service = BailService::new(inner_service, preprocessor);
 
         // Service should be ready since we'll bail out anyway
-        let poll_result = poll_once(|cx| bailout_service.poll_ready(cx));
+        let poll_result = poll_once(|cx| bail_service.poll_ready(cx));
         assert_eq!(poll_result, Poll::Ready(Ok(())));
 
-        // Test call with bailout
+        // Test call with bail
         let request = TestRequest { value: 10 };
-        let response_future = bailout_service.call(request);
+        let response_future = bail_service.call(request);
 
         let response = response_future.await.unwrap();
-        // Should get our bailout response, not the result of inner service
+        // Should get our bail response, not the result of inner service
         assert_eq!(response, TestResponse { value: 42 });
     }
 
     #[tokio::test]
-    async fn bailout_layer() {
+    async fn bail_layer() {
         let inner_service = MockService::new(true, 5);
         let preprocessor = |req: TestRequest| Ok(req);
 
@@ -332,9 +332,9 @@ mod tests {
         let inner_service = MockService::new(true, 5);
         let preprocessor = |req: TestRequest| Ok::<_, Infallible>(req);
 
-        let bailout_service = BailService::new(inner_service, preprocessor);
+        let bail_service = BailService::new(inner_service, preprocessor);
 
-        let debug_output = format!("{:?}", bailout_service);
+        let debug_output = format!("{:?}", bail_service);
         assert!(debug_output.contains("BailService"));
 
         let layer = BailLayer::new(preprocessor);
@@ -343,23 +343,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bailout_future() {
+    async fn bail_future() {
         use super::future::BailFuture;
 
         // Test the future case
         let inner_future = async { Ok::<_, Infallible>(TestResponse { value: 123 }) };
-        let bailout_future = BailFuture::<_, _, Infallible>::future(inner_future);
-        let result = bailout_future.await.unwrap();
+        let bail_future = BailFuture::<_, _, Infallible>::future(inner_future);
+        let result = bail_future.await.unwrap();
         assert_eq!(result, TestResponse { value: 123 });
 
         // Test the bail case
         let response = TestResponse { value: 456 };
-        let bailout_future = BailFuture::<
+        let bail_future = BailFuture::<
             Pin<Box<dyn Future<Output = Result<TestResponse, Infallible>>>>,
             _,
             Infallible,
         >::bail(response);
-        let result = bailout_future.await.unwrap();
+        let result = bail_future.await.unwrap();
         assert_eq!(result, TestResponse { value: 456 });
     }
 
@@ -368,11 +368,11 @@ mod tests {
         let inner_service = MockService::new(false, 5); // Not ready
         let preprocessor = |req: TestRequest| Ok(req);
 
-        let mut bailout_service = BailService::new(inner_service, preprocessor);
+        let mut bail_service = BailService::new(inner_service, preprocessor);
 
         // Test poll_ready should be pending
         let poll_result =
-            bailout_service.poll_ready(&mut Context::from_waker(std::task::Waker::noop()));
+            bail_service.poll_ready(&mut Context::from_waker(std::task::Waker::noop()));
 
         assert!(matches!(poll_result, Poll::Pending));
     }
@@ -395,21 +395,21 @@ mod tests {
             }
         };
 
-        let mut bailout_service = BailService::new(inner_service, preprocessor);
+        let mut bail_service = BailService::new(inner_service, preprocessor);
 
         // Test case 1: value <= 50, should pass through unchanged
         let request = TestRequest { value: 30 };
-        let response = bailout_service.call(request).await.unwrap();
+        let response = bail_service.call(request).await.unwrap();
         assert_eq!(response, TestResponse { value: 35 }); // 30 + 5
 
         // Test case 2: 50 < value <= 100, should modify request
         let request = TestRequest { value: 60 };
-        let response = bailout_service.call(request).await.unwrap();
+        let response = bail_service.call(request).await.unwrap();
         assert_eq!(response, TestResponse { value: 47 }); // 42 + 5
 
         // Test case 3: value > 100, should bail out
         let request = TestRequest { value: 150 };
-        let response = bailout_service.call(request).await.unwrap();
-        assert_eq!(response, TestResponse { value: 999 }); // Bailout response
+        let response = bail_service.call(request).await.unwrap();
+        assert_eq!(response, TestResponse { value: 999 }); // bail response
     }
 }
