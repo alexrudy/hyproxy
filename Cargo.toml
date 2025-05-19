@@ -14,7 +14,7 @@ keywords = ["hyper", "http", "server", "async"]
 
 
 [dependencies]
-hyperdriver = { version = "0.8.5", features = ["stream"] }
+hyperdriver = { version = "0.10.0", features = ["stream"] }
 http = "1.2.0"
 thiserror = "2.0.12"
 tracing = "0.1.41"
