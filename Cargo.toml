@@ -6,7 +6,7 @@ description = "Proxy helpers for hyper services"
 license = "MIT"
 repository = "https://github.com/alexrudy/hyproxy"
 documentation = "https://docs.rs/hyproxy"
-rust-version = "1.74"
+rust-version = "1.85"
 readme = "README.md"
 authors = ["Alex Rudy <opensource@alexrudy.net>"]
 categories = ["network-programming", "web-programming::http-server"]
@@ -14,7 +14,7 @@ keywords = ["hyper", "http", "server", "async"]
 
 
 [dependencies]
-hyperdriver = { version = "0.8.5", features = ["stream"] }
+hyperdriver = { version = "0.11", features = ["stream"] }
 http = "1.3.1"
 thiserror = "2.0.12"
 tracing = "0.1.41"
