@@ -116,7 +116,8 @@ where
 impl<S, C, B> tower::Service<ExecuteRequest<C, B>> for ProxyUriService<S>
 where
     S: tower::Service<ExecuteRequest<C, B>>,
-    C: Connection<B> + PoolableConnection,
+    C: Connection<B> + PoolableConnection<B>,
+    B: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
