@@ -858,12 +858,7 @@ impl fmt::Display for XForwardAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0.ip {
             IpAddr::V4(ip) => write!(f, "{}", ip),
-            IpAddr::V6(ip) => write!(f, "[{}]", ip),
-        }?;
-
-        match &self.0.port {
-            Some(port) => write!(f, ":{}", port),
-            None => Ok(()),
+            IpAddr::V6(ip) => write!(f, "{}", ip),
         }
     }
 }
@@ -906,7 +901,7 @@ impl ForwardedHost {
     }
 
     /// Create the X-Forwarded header value for the `ForwardedHost`.
-    pub fn x_forwarded(&self) -> XForwardedHost {
+    pub fn x_forwarded(&self) -> XForwardedHost<'_> {
         XForwardedHost(self)
     }
 
@@ -1379,7 +1374,7 @@ mod tests {
 
         assert_eq!(
             request.headers().get("x-forwarded-for").unwrap(),
-            "[2001:db8:cafe::17]:4711"
+            "2001:db8:cafe::17"
         );
     }
 
@@ -1540,7 +1535,7 @@ mod tests {
             .headers()
             .get(X_FORWARDED_FOR)
             .expect("Missing X-Forwarded-For");
-        assert_eq!(x_forwarded_for, "[::1]:8080");
+        assert_eq!(x_forwarded_for, "::1");
 
         let x_forwarded_host = response
             .headers()
