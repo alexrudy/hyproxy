@@ -8,10 +8,8 @@
 //! the scheme of the URI to a default value when it is
 //! not set.
 
-use hyperdriver::{
-    client::{conn::Connection, pool::PoolableConnection},
-    service::ExecuteRequest,
-};
+use chateau::client::pool::PoolableConnection;
+use hyperdriver::client::conn::Connection;
 
 /// A layer that sets the scheme of the URI to a default.
 ///
@@ -113,9 +111,9 @@ where
     }
 }
 
-impl<S, C, B> tower::Service<ExecuteRequest<C, B>> for ProxyUriService<S>
+impl<S, C, B> tower::Service<(C, http::Request<B>)> for ProxyUriService<S>
 where
-    S: tower::Service<ExecuteRequest<C, B>>,
+    S: tower::Service<(C, http::Request<B>)>,
     C: Connection<B> + PoolableConnection<B>,
     B: Send + 'static,
 {
@@ -123,8 +121,8 @@ where
     type Error = S::Error;
     type Future = S::Future;
 
-    fn call(&mut self, mut req: ExecuteRequest<C, B>) -> Self::Future {
-        self.set_scheme(req.request_mut());
+    fn call(&mut self, mut req: (C, http::Request<B>)) -> Self::Future {
+        self.set_scheme(&mut req.1);
 
         self.service.call(req)
     }

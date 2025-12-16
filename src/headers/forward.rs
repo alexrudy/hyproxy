@@ -9,7 +9,7 @@ use std::net::{AddrParseError, IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use hyperdriver::info::ConnectionInfo;
+use hyperdriver::info::{BraidAddr, ConnectionInfo};
 use nom::Finish;
 use thiserror::Error;
 
@@ -167,7 +167,7 @@ impl Forwarded {
         let mut host = None;
         let mut proto = None;
 
-        if let Some(info) = request.extensions().get::<ConnectionInfo>() {
+        if let Some(info) = request.extensions().get::<ConnectionInfo<BraidAddr>>() {
             if let Some(remote) = info.remote_addr.clone().canonical().tcp() {
                 r#for = Some(Forwardee::Address(remote.into()));
             }
@@ -1017,7 +1017,7 @@ impl ForwardedHeaderConfig {
 
         match self.by {
             ForwardeeMode::Address => {
-                if let Some(info) = request.extensions().get::<ConnectionInfo>() {
+                if let Some(info) = request.extensions().get::<ConnectionInfo<BraidAddr>>() {
                     if let Some(local) = info.local_addr.clone().canonical().tcp() {
                         forwarded.by = Some(Forwardee::Address(local.into()));
                     }
@@ -1030,7 +1030,7 @@ impl ForwardedHeaderConfig {
 
         match self.r#for {
             ForwardeeMode::Address => {
-                if let Some(info) = request.extensions().get::<ConnectionInfo>() {
+                if let Some(info) = request.extensions().get::<ConnectionInfo<BraidAddr>>() {
                     if let Some(remote) = info.remote_addr.clone().canonical().tcp() {
                         forwarded.r#for = Some(Forwardee::Address(remote.into()));
                     }
@@ -1434,7 +1434,7 @@ mod tests {
         assert_eq!(forwarded.proto, None);
     }
 
-    fn connection_info() -> ConnectionInfo {
+    fn connection_info() -> ConnectionInfo<BraidAddr> {
         ConnectionInfo {
             local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80).into(),
             remote_addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080).into(),
