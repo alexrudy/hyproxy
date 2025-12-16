@@ -290,6 +290,7 @@ name = "hyproxy"
 version = "0.11.2"
 dependencies = [
  "bytes",
+ "chateau",
  "http",
  "hyper",
  "hyperdriver",
