@@ -46,22 +46,6 @@ checksum = "9555578bc9e57714c812a1f84e4fc5b4d21fcb063490c624de019f7464c91268"
 
 [[package]]
 name = "chateau"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc63afb014b70e095310788a3ff02caa2b6b6bea8a596e70723e4700036699f6"
-dependencies = [
- "futures",
- "parking_lot",
- "pin-project",
- "socket2",
- "thiserror",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "chateau"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cc1e852101a786958c82f33988ef043172bee991cc8820a570f6e3bb08523f8"
@@ -278,13 +262,13 @@ dependencies = [
 
 [[package]]
 name = "hyperdriver"
-version = "0.12.2"
+version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36d331f4131f970bb7d3ab8dd721f69f2a791eed7bb8b6caf091439541c4f355"
+checksum = "8fee0eec17ee876113efd9f64c2171b5058388db90e62cf3ce18a1327df9063b"
 dependencies = [
  "bytes",
  "camino",
- "chateau 0.2.1",
+ "chateau",
  "futures-core",
  "futures-util",
  "http",
@@ -292,7 +276,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "ouroboros",
- "parking_lot",
  "pin-project",
  "thiserror",
  "tokio",
@@ -306,7 +289,7 @@ name = "hyproxy"
 version = "0.12.0"
 dependencies = [
  "bytes",
- "chateau 0.3.1",
+ "chateau",
  "http",
  "hyper",
  "hyperdriver",
