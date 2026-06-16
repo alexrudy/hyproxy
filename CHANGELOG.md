@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/alexrudy/hyproxy/compare/v0.12.0...v0.12.1) - 2026-06-16
+
+### Other
+
+- Merge pull request #51 from alexrudy/dependabot/cargo/bytes-1.11.1
+- Merge pull request #50 from alexrudy/dependabot/cargo/tokio-1.50.0
+- Merge pull request #48 from alexrudy/dependabot/cargo/pin-project-lite-0.2.17
+- *(deps)* bump pin-project-lite from 0.2.16 to 0.2.17
+
 ## [0.12.0](https://github.com/alexrudy/hyproxy/compare/v0.11.2...v0.12.0) - 2026-06-05
 
 ### Other
