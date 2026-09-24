@@ -10,14 +10,33 @@ env:
   RUSTDOCFLAGS: "-Dwarnings"
 
 jobs:
+
+  versions:
+    name: Determine toolchain versions
+    runs-on: ubuntu-latest
+    outputs:
+      msrv: ${{ steps.msrv.outputs.version }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Read MSRV
+        id: msrv
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^rust-version/{print $2}' Cargo.toml)
+          echo "MSRV: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build
+    needs: versions
     runs-on: ubuntu-latest
     strategy:
       matrix:
         target:
           - x86_64-unknown-linux-gnu
         toolchain:
+          - "${{ needs.versions.outputs.msrv }}"
           - stable
           - nightly
           - beta
@@ -58,19 +77,6 @@ jobs:
         if: matrix.steps.hack
       - name: ${{ matrix.steps.name }}
         run: ${{ matrix.steps.run }}
-
-  msrv:
-    name: MSRV 1.87
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-      - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.87"
-      - name: Run cargo build
-        run: cargo check --all-targets --all-features
 
   test:
     name: Tests
