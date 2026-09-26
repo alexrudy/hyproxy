@@ -7,6 +7,10 @@
 #![deny(unsafe_code)]
 
 pub mod bail;
+#[cfg(all(not(feature = "hyperdriver"), feature = "upgrade"))]
+mod bridge;
 pub mod headers;
+
+#[cfg(feature = "upgrade")]
 pub mod upgrade;
 pub mod uri;

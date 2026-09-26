@@ -9,7 +9,6 @@ use std::net::{AddrParseError, IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use hyperdriver::info::{BraidAddr, ConnectionInfo};
 use nom::Finish;
 use thiserror::Error;
 
@@ -133,6 +132,109 @@ impl ForwardedRecord {
     }
 }
 
+/// The remote address for the current connection.
+///
+/// This is expected to be present in the http::Request extensions
+/// when using the connection.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RemoteAddress(pub ForwardAddress);
+
+/// The local address for the current connection.
+///
+/// This is expected to be present in the http::Request extensions
+/// when using the connection.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LocalAddress(pub ForwardAddress);
+
+#[cfg(feature = "hyperdriver")]
+pub use self::info::{ConnectionInfoAdapter, ConnectionInfoAdapterLayer};
+
+#[cfg(feature = "hyperdriver")]
+mod info {
+    use std::net::SocketAddr;
+
+    use hyperdriver::info::ConnectionInfo;
+
+    use super::{LocalAddress, RemoteAddress};
+
+    /// A layer that wraps a service with a [`ConnectionInfoAdapter`].
+    ///
+    /// This adapts the hyperdriver-specific [`ConnectionInfo`] object
+    /// and provides the hyproxy-specific [`RemoteAddress`] and [`LocalAddress`]
+    /// for use in the Forward headers.
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct ConnectionInfoAdapterLayer;
+
+    impl<S> tower::Layer<S> for ConnectionInfoAdapterLayer {
+        type Service = ConnectionInfoAdapter<S>;
+
+        fn layer(&self, inner: S) -> Self::Service {
+            ConnectionInfoAdapter::new(inner)
+        }
+    }
+
+    /// A service to provide the connection info for a request.
+    ///
+    /// This adapts the hyperdriver-specific [`ConnectionInfo`] object
+    /// and provides the hyproxy-specific [`RemoteAddress`] and [`LocalAddress`]
+    /// for use in the Forward headers.
+    #[derive(Debug, Default, Clone)]
+    pub struct ConnectionInfoAdapter<S> {
+        service: S,
+    }
+
+    impl<S> ConnectionInfoAdapter<S> {
+        /// Creates a new [`ConnectionInfoAdapter`] with the given service.
+        pub fn new(service: S) -> Self {
+            Self { service }
+        }
+
+        /// Returns a reference to the inner service.
+        pub fn inner(&self) -> &S {
+            &self.service
+        }
+
+        /// Returns the inner service, consuming this adapter.
+        pub fn into_inner(self) -> S {
+            self.service
+        }
+    }
+
+    impl<B, S> tower::Service<http::Request<B>> for ConnectionInfoAdapter<S>
+    where
+        S: tower::Service<http::Request<B>>,
+    {
+        type Response = S::Response;
+
+        type Error = S::Error;
+
+        type Future = S::Future;
+
+        fn poll_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            self.service.poll_ready(cx)
+        }
+
+        fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
+            if let Some(info) = req.extensions().get::<ConnectionInfo>().cloned() {
+                if let Some(&remote) = info.remote_addr.downcast_ref::<SocketAddr>() {
+                    req.extensions_mut().insert(RemoteAddress(remote.into()));
+                }
+
+                if let Some(&local) = info.local_addr.downcast_ref::<SocketAddr>() {
+                    req.extensions_mut().insert(LocalAddress(local.into()));
+                }
+            } else {
+                tracing::warn!("Connection info not found")
+            }
+
+            self.service.call(req)
+        }
+    }
+}
+
 /// The contents of one record in a `Forwarded` header.
 ///
 /// A forwarded header can consist of multiple comma-separated records, each containing a set of key-value pairs.
@@ -159,24 +261,20 @@ impl Forwarded {
     /// Create a new `Forwarded` header from a request.
     ///
     /// This should receive the request sent to the proxy server, and will extract the necessary information from it.
-    /// It expects that the request has been processed by some middleware that adds the `ConnectionInfo` extension,
-    /// which contains the remote and local addresses of the connection.
+    /// It expects that the request has been processed by some middleware that adds the `RemoteAddress` extension,
+    /// and optionally the local address.
     pub fn new<B>(request: &http::Request<B>) -> Self {
         let mut by = None;
         let mut r#for = None;
         let mut host = None;
         let mut proto = None;
 
-        if let Some(info) = request.extensions().get::<ConnectionInfo<BraidAddr>>() {
-            if let Some(remote) = info.remote_addr.clone().canonical().tcp() {
-                r#for = Some(Forwardee::Address(remote.into()));
-            }
+        if let Some(&remote) = request.extensions().get::<RemoteAddress>() {
+            r#for = Some(Forwardee::Address(remote.0));
+        }
 
-            if let Some(local) = info.local_addr.clone().canonical().tcp() {
-                by = Some(Forwardee::Address(local.into()));
-            }
-        } else {
-            tracing::warn!("No connection info found in request extensions");
+        if let Some(&local) = request.extensions().get::<LocalAddress>() {
+            by = Some(Forwardee::Address(local.0));
         }
 
         if let Some(host_header) = request
@@ -239,23 +337,23 @@ impl Forwarded {
     }
 
     /// Convert this `Forwarded` header to a byte string.
-    pub fn as_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> Bytes {
         let mut bytes = BytesMut::new();
         if let Some(forwardee) = &self.by {
             bytes.put(&b"by="[..]);
-            bytes.put(forwardee.as_bytes());
+            bytes.put(forwardee.to_bytes());
             bytes.put_u8(b';');
         }
 
         if let Some(forwardee) = &self.r#for {
             bytes.put(&b"for="[..]);
-            bytes.put(forwardee.as_bytes());
+            bytes.put(forwardee.to_bytes());
             bytes.put_u8(b';');
         }
 
         if let Some(host) = &self.host {
             bytes.put(&b"host="[..]);
-            bytes.put(host.as_bytes());
+            bytes.put(host.to_bytes());
             bytes.put_u8(b';');
         }
 
@@ -281,7 +379,7 @@ impl Forwarded {
 
     /// Convert this `Forwarded` header to a `http::HeaderValue`.
     pub fn to_header_value(&self) -> http::HeaderValue {
-        http::HeaderValue::from_bytes(self.as_bytes().as_ref())
+        http::HeaderValue::from_bytes(self.to_bytes().as_ref())
             .expect("valid header from typed Forwarded")
     }
 
@@ -312,7 +410,7 @@ impl HeaderRecordKind for Forwarded {
     type Error = ParseForwardedError;
 
     fn into_bytes(self) -> Vec<u8> {
-        self.as_bytes().to_vec()
+        self.to_bytes().to_vec()
     }
 
     fn parse_header_value(header: &http::HeaderValue) -> Result<Vec<Record<Self>>, Self::Error> {
@@ -545,7 +643,7 @@ impl Forwardee {
     }
 
     /// Convert the `Forwardee` to a byte string.
-    pub fn as_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> Bytes {
         match self {
             Forwardee::Named(token) => {
                 let mut bytes = BytesMut::new();
@@ -553,7 +651,7 @@ impl Forwardee {
                 bytes.put(token.as_bytes());
                 bytes.freeze()
             }
-            Forwardee::Address(addr) => addr.as_bytes(),
+            Forwardee::Address(addr) => addr.to_bytes(),
             Forwardee::Unknown => Bytes::from_static(b"unknown"),
         }
     }
@@ -695,7 +793,7 @@ impl ForwardAddress {
     }
 
     /// Convert the `ForwardAddress` to a byte string.
-    pub fn as_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> Bytes {
         let mut bytes = BytesMut::new();
 
         match &self.ip {
@@ -725,7 +823,7 @@ impl ForwardAddress {
 
     /// Convert the `ForwardAddress` to a `http::HeaderValue`.
     pub fn as_header_value(&self) -> http::HeaderValue {
-        http::HeaderValue::from_bytes(self.as_bytes().as_ref()).unwrap()
+        http::HeaderValue::from_bytes(self.to_bytes().as_ref()).unwrap()
     }
 }
 
@@ -888,7 +986,7 @@ impl ForwardedHost {
     }
 
     /// Convert the `ForwardedHost` to a byte string.
-    pub fn as_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> Bytes {
         let mut bytes = BytesMut::new();
         bytes.put(self.host.as_bytes());
 
@@ -935,7 +1033,7 @@ pub struct XForwardedHost<'a>(&'a ForwardedHost);
 impl XForwardedHost<'_> {
     /// The `X-Forwarded-Host` header value for the `XForwardedHost`.
     pub fn as_header_value(&self) -> http::HeaderValue {
-        http::HeaderValue::from_bytes(self.0.as_bytes().as_ref()).unwrap()
+        http::HeaderValue::from_bytes(self.0.to_bytes().as_ref()).unwrap()
     }
 }
 
@@ -1017,10 +1115,8 @@ impl ForwardedHeaderConfig {
 
         match self.by {
             ForwardeeMode::Address => {
-                if let Some(info) = request.extensions().get::<ConnectionInfo<BraidAddr>>() {
-                    if let Some(local) = info.local_addr.clone().canonical().tcp() {
-                        forwarded.by = Some(Forwardee::Address(local.into()));
-                    }
+                if !matches!(forwarded.by, Some(Forwardee::Address(_))) {
+                    forwarded.by = None;
                 }
             }
             ForwardeeMode::Named(ref name) => forwarded.by = Some(Forwardee::Named(name.clone())),
@@ -1030,10 +1126,8 @@ impl ForwardedHeaderConfig {
 
         match self.r#for {
             ForwardeeMode::Address => {
-                if let Some(info) = request.extensions().get::<ConnectionInfo<BraidAddr>>() {
-                    if let Some(remote) = info.remote_addr.clone().canonical().tcp() {
-                        forwarded.r#for = Some(Forwardee::Address(remote.into()));
-                    }
+                if !matches!(forwarded.r#for, Some(Forwardee::Address(_))) {
+                    forwarded.r#for = None;
                 }
             }
             ForwardeeMode::Named(ref name) => {
@@ -1184,29 +1278,37 @@ impl<S> tower::layer::Layer<S> for SetForwardedHeaderLayer {
 mod tests {
     use std::net::Ipv4Addr;
 
-    use hyperdriver::info::BraidAddr;
     use tower::ServiceExt;
 
     use super::*;
+
+    fn connection_info<B>(request: &mut http::Request<B>) {
+        request.extensions_mut().insert(LocalAddress(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80).into(),
+        ));
+        request.extensions_mut().insert(RemoteAddress(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080).into(),
+        ));
+    }
 
     #[test]
     fn forwardee_display() {
         assert_eq!(
             Forwardee::Address("127.0.0.1".parse().unwrap())
-                .as_bytes()
+                .to_bytes()
                 .as_ref(),
             b"127.0.0.1"
         );
         assert_eq!(
             Forwardee::Address("[::1]:8080".parse().unwrap())
-                .as_bytes()
+                .to_bytes()
                 .as_ref(),
             b"\"[::1]:8080\""
         );
-        assert_eq!(Forwardee::Unknown.as_bytes().as_ref(), b"unknown");
+        assert_eq!(Forwardee::Unknown.to_bytes().as_ref(), b"unknown");
         assert_eq!(
             Forwardee::Named(Token::from_static("name"))
-                .as_bytes()
+                .to_bytes()
                 .as_ref(),
             b"_name"
         );
@@ -1250,7 +1352,7 @@ mod tests {
         };
 
         assert_eq!(
-            forwarded.as_bytes().as_ref(),
+            forwarded.to_bytes().as_ref(),
             b"for=\"[2001:db8:cafe::17]:4711\""
         );
 
@@ -1262,7 +1364,7 @@ mod tests {
         };
 
         assert_eq!(
-            forwarded.as_bytes().as_ref(),
+            forwarded.to_bytes().as_ref(),
             b"by=203.0.113.43;for=192.0.2.60;proto=http"
         );
     }
@@ -1356,7 +1458,7 @@ mod tests {
             ..Default::default()
         };
 
-        let parsed = Forwarded::parse_record(forwarded.as_bytes().as_ref()).unwrap();
+        let parsed = Forwarded::parse_record(forwarded.to_bytes().as_ref()).unwrap();
         assert_eq!(parsed, forwarded);
     }
 
@@ -1388,19 +1490,14 @@ mod tests {
         };
 
         let mut request = http::Request::new(());
-        request
-            .extensions_mut()
-            .insert(ConnectionInfo::<BraidAddr> {
-                local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80).into(),
-                remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080).into(),
-            });
+        connection_info(&mut request);
         let forwarded = config.from_request(&request);
 
         assert_eq!(forwarded.by, None);
         assert_eq!(
             forwarded.r#for.as_ref(),
             Some(&Forwardee::Address(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080).into()
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080).into()
             ))
         );
         assert_eq!(forwarded.host, None);
@@ -1414,12 +1511,8 @@ mod tests {
         };
 
         let mut request = http::Request::new(());
-        request
-            .extensions_mut()
-            .insert(ConnectionInfo::<BraidAddr> {
-                local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80).into(),
-                remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080).into(),
-            });
+        connection_info(&mut request);
+
         let forwarded = config.from_request(&request);
 
         assert_eq!(
@@ -1434,17 +1527,10 @@ mod tests {
         assert_eq!(forwarded.proto, None);
     }
 
-    fn connection_info() -> ConnectionInfo<BraidAddr> {
-        ConnectionInfo {
-            local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80).into(),
-            remote_addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080).into(),
-        }
-    }
-
     #[test]
     fn forwarded_header_from_request() {
         let mut request = http::Request::new(());
-        request.extensions_mut().insert(connection_info());
+        connection_info(&mut request);
 
         let forwarded = Forwarded::new(&request);
 
@@ -1466,7 +1552,8 @@ mod tests {
         );
 
         let mut request = http::Request::get("http://example.com").body(()).unwrap();
-        request.extensions_mut().insert(connection_info());
+        connection_info(&mut request);
+
         request
             .headers_mut()
             .insert(http::header::HOST, "example.com".parse().unwrap());
@@ -1500,7 +1587,7 @@ mod tests {
             request
                 .headers_mut()
                 .insert(http::header::HOST, "example.com".parse().unwrap());
-            request.extensions_mut().insert(connection_info());
+            connection_info(&mut request);
 
             let response = service.oneshot(request).await.unwrap();
             let forwarded = response.headers().get(FORWARDED).unwrap();
@@ -1525,7 +1612,7 @@ mod tests {
         request
             .headers_mut()
             .insert(http::header::HOST, "example.com".parse().unwrap());
-        request.extensions_mut().insert(connection_info());
+        connection_info(&mut request);
 
         let response = service.oneshot(request).await.unwrap();
         let forwarded = response.headers().get(FORWARDED).unwrap();
@@ -1567,7 +1654,7 @@ mod tests {
         request
             .headers_mut()
             .insert(http::header::HOST, "example.com".parse().unwrap());
-        request.extensions_mut().insert(connection_info());
+        connection_info(&mut request);
 
         let response = service.oneshot(request).await.unwrap();
         let forwarded = response.headers().get(FORWARDED).unwrap();
@@ -1609,7 +1696,7 @@ mod tests {
             http::HeaderValue::from_bytes(b"not-a-valid value\xaf, for=192.0.2.5;proto=https")
                 .unwrap(),
         );
-        request.extensions_mut().insert(connection_info());
+        connection_info(&mut request);
 
         let response = service.oneshot(request).await.unwrap();
         let forwarded = response.headers().get(FORWARDED).unwrap();
@@ -1644,7 +1731,7 @@ mod tests {
             .unwrap(),
         );
 
-        request.extensions_mut().insert(connection_info());
+        connection_info(&mut request);
 
         let response = service.oneshot(request).await.unwrap();
         let headers = response.headers().get_all(FORWARDED);

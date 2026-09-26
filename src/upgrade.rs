@@ -260,7 +260,11 @@ mod future {
 
     use std::task::ready;
 
+    #[cfg(not(feature = "hyperdriver"))]
+    use crate::bridge::TokioIo;
+    #[cfg(feature = "hyperdriver")]
     use hyperdriver::bridge::io::TokioIo;
+
     use tokio::io::copy_bidirectional;
 
     use super::*;

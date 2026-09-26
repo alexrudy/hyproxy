@@ -8,9 +8,6 @@
 //! the scheme of the URI to a default value when it is
 //! not set.
 
-use chateau::client::pool::PoolableConnection;
-use hyperdriver::client::conn::Connection;
-
 /// A layer that sets the scheme of the URI to a default,
 /// and optionally sets the authority of the URI.
 ///
@@ -140,7 +137,6 @@ where
 impl<S, C, B> tower::Service<(C, http::Request<B>)> for ProxyUriService<S>
 where
     S: tower::Service<(C, http::Request<B>)>,
-    C: Connection<B> + PoolableConnection<B>,
     B: Send + 'static,
 {
     type Response = S::Response;
