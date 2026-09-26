@@ -19,7 +19,7 @@ http = "1"
 thiserror = "2"
 tracing = "0.1"
 tower = "0.5"
-tokio = { version = "1", features = ["macros"] }
+tokio = { version = "1", optional = true }
 pin-project-lite = "0.2"
 nom = "7"
 bytes = "1"
@@ -31,4 +31,4 @@ tokio = { version = "1", features = ["macros", "rt"] }
 
 [features]
 hyperdriver = ["dep:hyperdriver"]
-upgrade = ["dep:hyper", "tokio/io-util"]
+upgrade = ["dep:hyper", "tokio/io-util", "tokio/rt"]
