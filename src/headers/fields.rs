@@ -5,27 +5,31 @@
 use core::fmt;
 
 use bytes::Bytes;
+use nom::Parser;
 use thiserror::Error;
 
 use super::parser::{quoted_text, record, records, token, NoTail as _};
 
 /// Parse a header value into a sequence of field values.
 pub fn parse_header(input: &[u8], delimiter: u8) -> Result<Vec<FieldValue>, InvalidValue> {
-    records(delimiter)(input)
+    records(delimiter)
+        .parse(input)
         .no_tail()
         .map_err(|_| InvalidValue("header", Bytes::copy_from_slice(input)))
 }
 
 /// Parse a field value.
 pub fn parse_field(input: &[u8]) -> Result<FieldValue, InvalidValue> {
-    record()(input)
+    record()
+        .parse(input)
         .no_tail()
         .map_err(|_| InvalidValue("field", Bytes::copy_from_slice(input)))
 }
 
 /// Parse a token.
 pub fn parse_token(input: &[u8]) -> Result<Token, InvalidValue> {
-    token()(input)
+    token()
+        .parse(input)
         .no_tail()
         .map_err(|_| InvalidValue("token", Bytes::copy_from_slice(input)))
 }

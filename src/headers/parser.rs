@@ -10,7 +10,7 @@ use nom::character::complete::{satisfy, space0};
 use nom::combinator::map;
 use nom::multi::separated_list0;
 use nom::sequence::delimited;
-use nom::{Finish, IResult, InputLength};
+use nom::{AsChar, Finish, IResult, Input, Parser};
 
 use super::fields::{Entry, FieldKey, FieldValue, QuotedText, Token};
 
@@ -49,7 +49,9 @@ const fn is_escapable(c: u8) -> bool {
     c == b'\t' || c == b' ' || is_visible_ascii(c)
 }
 
-fn byte<'f, F>(cond: F) -> impl Fn(&'f [u8]) -> IResult<&'f [u8], char>
+fn to_char<'f, F>(
+    cond: F,
+) -> impl Parser<&'f [u8], Output = char, Error = nom::error::Error<&'f [u8]>>
 where
     F: Fn(u8) -> bool + Copy,
 {
@@ -57,15 +59,16 @@ where
 }
 
 fn qd_text(v: &[u8]) -> IResult<&[u8], &[u8]> {
-    escaped(take_while1(is_qd_text), '\\', byte(is_escapable))(v)
+    escaped(take_while1(is_qd_text), '\\', to_char(is_escapable)).parse(v)
 }
 
 pub(crate) fn quoted_text(v: &[u8]) -> IResult<&[u8], QuotedText> {
     delimited(
-        tag(b"\""),
+        tag(b"\"".as_slice()),
         map(qd_text, |q| QuotedText::new(Bytes::copy_from_slice(q))),
-        tag(b"\""),
-    )(v)
+        tag(b"\"".as_slice()),
+    )
+    .parse(v)
 }
 
 #[cfg(test)]
@@ -105,13 +108,15 @@ mod test_quoted {
     }
 }
 
-pub(crate) fn token<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], Token> {
+pub(crate) fn token<'a>(
+) -> impl Parser<&'a [u8], Output = Token, Error = nom::error::Error<&'a [u8]>> {
     map(take_while1(is_token), |t: &[u8]| {
         Token::new(Bytes::copy_from_slice(t))
     })
 }
 
-pub(crate) fn key<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], FieldKey> {
+pub(crate) fn key<'a>(
+) -> impl Parser<&'a [u8], Output = FieldKey, Error = nom::error::Error<&'a [u8]>> {
     map(token(), FieldKey::new)
 }
 
@@ -122,20 +127,21 @@ mod test_token {
     #[test]
     fn token_check() {
         let input = b"abc";
-        token()(input).no_tail().unwrap();
+        token().parse(input).no_tail().unwrap();
 
         let input = b"abc123";
-        token()(input).no_tail().unwrap();
+        token().parse(input).no_tail().unwrap();
 
         let input = b"abc!#";
-        token()(input).no_tail().unwrap();
+        token().parse(input).no_tail().unwrap();
 
         let input = b"";
-        assert!(token()(input).no_tail().is_err());
+        assert!(token().parse(input).no_tail().is_err());
     }
 }
 
-pub(crate) fn record<'v>() -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], FieldValue> {
+pub(crate) fn record<'v>(
+) -> impl Parser<&'v [u8], Output = FieldValue, Error = nom::error::Error<&'v [u8]>> {
     map(
         alt((
             map(quoted_text, Entry::QuotedText),
@@ -145,21 +151,40 @@ pub(crate) fn record<'v>() -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], FieldVal
     )
 }
 
-pub(crate) fn strip_whitespace<'v, F, O>(parser: F) -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], O>
+pub(crate) fn strip_whitespace<'v, F, O, E, T>(parser: F) -> impl Parser<T, Output = O, Error = E>
 where
-    F: FnMut(&'v [u8]) -> IResult<&'v [u8], O>,
+    F: Parser<T, Output = O, Error = E>,
+    T: Input,
+    T::Item: AsChar + Clone,
+    E: nom::error::ParseError<T>,
 {
     delimited(space0, parser, space0)
 }
 
+pub(crate) fn byte<'v>(
+    target: u8,
+) -> impl Parser<&'v [u8], Output = (), Error = nom::error::Error<&'v [u8]>> {
+    move |input: &'v [u8]| -> IResult<&'v [u8], ()> {
+        if input.len() == 0 {
+            Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Eof,
+            )))
+        } else if input[0] == target {
+            Ok((&input[1..], ()))
+        } else {
+            Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )))
+        }
+    }
+}
+
 pub(crate) fn records<'v>(
     delimiter: u8,
-) -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], Vec<FieldValue>> {
-    let d = [delimiter];
-    move |v| {
-        let one_record = strip_whitespace(record());
-        separated_list0(tag(&d[..]), one_record)(v)
-    }
+) -> impl Parser<&'v [u8], Output = Vec<FieldValue>, Error = nom::error::Error<&'v [u8]>> {
+    separated_list0(byte(delimiter), strip_whitespace(record()))
 }
 
 #[cfg(test)]
@@ -169,22 +194,22 @@ mod test_record {
     #[test]
     fn record_check() {
         let input = b"abc";
-        record()(input).no_tail().unwrap();
+        record().parse(input).no_tail().unwrap();
 
         let input = b"\"abc\"";
-        record()(input).no_tail().unwrap();
+        record().parse(input).no_tail().unwrap();
     }
 
     #[test]
     fn records_check() {
         let input = b"abc, \"def\"";
-        records(b',')(input).no_tail().unwrap();
+        dbg!(records(b',').parse(input)).no_tail().unwrap();
 
         let input = b"abc, \"def\",";
-        records(b',')(input).no_tail().unwrap_err();
+        records(b',').parse(input).no_tail().unwrap_err();
 
         let input = b"abc, \"def\"   ";
-        assert_eq!(records(b',')(input).no_tail().unwrap().len(), 2);
+        assert_eq!(records(b',').parse(input).no_tail().unwrap().len(), 2);
     }
 }
 
@@ -194,7 +219,7 @@ pub(crate) trait NoTail<O, E> {
 
 impl<I, O> NoTail<O, nom::error::Error<I>> for IResult<I, O>
 where
-    I: InputLength,
+    I: Input,
 {
     fn no_tail(self) -> Result<O, nom::error::Error<I>> {
         match self.finish() {
@@ -207,7 +232,7 @@ where
 
 impl<I, O> NoTail<O, nom::error::Error<I>> for Result<(I, O), nom::error::Error<I>>
 where
-    I: InputLength,
+    I: Input,
 {
     fn no_tail(self) -> Result<O, nom::error::Error<I>> {
         match self {

@@ -6,7 +6,7 @@ use bytes::Bytes;
 use nom::character::complete::char;
 use nom::combinator::map;
 use nom::multi::separated_list0;
-use nom::IResult;
+use nom::Parser;
 use thiserror::Error;
 
 use super::chain::HeaderRecordKind;
@@ -71,7 +71,8 @@ impl HeaderRecordKind for ConnectionHeader {
     fn parse_header_value(
         header: &http::HeaderValue,
     ) -> Result<Vec<super::chain::Record<Self>>, Self::Error> {
-        parser()(header.as_bytes())
+        parser()
+            .parse(header.as_bytes())
             .no_tail()
             .map(|headers| headers.into_iter().map(Into::into).collect())
             .map_err(|error| {
@@ -83,7 +84,9 @@ impl HeaderRecordKind for ConnectionHeader {
     }
 }
 
-fn parser<'v>() -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], Vec<ConnectionHeader>> {
+fn parser<'v>(
+) -> impl nom::Parser<&'v [u8], Output = Vec<ConnectionHeader>, Error = nom::error::Error<&'v [u8]>>
+{
     map(
         separated_list0(char(','), strip_whitespace(super::parser::token())),
         |headers| {
@@ -361,7 +364,7 @@ mod tests {
     #[test]
     fn parse_connection_headers() {
         let headers = b"close, upgrade";
-        let headers = parser()(headers).no_tail().unwrap();
+        let headers = parser().parse(headers).no_tail().unwrap();
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].header(), http::HeaderName::from_static("close"));
         assert_eq!(headers[1].header(), http::header::UPGRADE);

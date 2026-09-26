@@ -6,15 +6,13 @@ use std::str::FromStr;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use http::HeaderValue;
-use nom::bytes::complete::tag;
 use nom::combinator::{map, opt};
 use nom::multi::separated_list0;
-use nom::sequence::tuple;
-use nom::IResult;
+use nom::Parser;
 use thiserror::Error;
 
 use crate::headers::fields::Token;
-use crate::headers::parser::{strip_whitespace, token, NoTail as _};
+use crate::headers::parser::{byte, strip_whitespace, token, NoTail as _};
 /// The `Upgrade` header field allows the sender to specify what protocols they would like to upgrade to.
 pub const UPGRADE: http::HeaderName = http::header::UPGRADE;
 
@@ -38,25 +36,29 @@ impl From<nom::error::Error<&[u8]>> for UpgradeProtocolError {
     }
 }
 
-fn protocol<'v>() -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], UpgradeProtocol> {
-    let v = tuple((tag(b"/"), token()));
+fn protocol<'v>(
+) -> impl Parser<&'v [u8], Output = UpgradeProtocol, Error = nom::error::Error<&'v [u8]>> {
+    let v = (byte(b'/'), token());
     let version = opt(map(v, |(_, version)| version));
 
-    map(tuple((token(), version)), |(name, version)| {
-        UpgradeProtocol { name, version }
+    map((token(), version), |(name, version)| UpgradeProtocol {
+        name,
+        version,
     })
 }
 
 fn parse_upgrade_protocols(
     value: &HeaderValue,
 ) -> Result<Vec<UpgradeProtocol>, UpgradeProtocolError> {
-    separated_list0(tag(b","), strip_whitespace(protocol()))(value.as_bytes())
+    separated_list0(byte(b','), strip_whitespace(protocol()))
+        .parse(value.as_bytes())
         .no_tail()
         .map_err(Into::into)
 }
 
 fn parse_connection_headers(value: &HeaderValue) -> Result<Vec<Token>, UpgradeProtocolError> {
-    separated_list0(tag(b","), strip_whitespace(token()))(value.as_bytes())
+    separated_list0(byte(b','), strip_whitespace(token()))
+        .parse(value.as_bytes())
         .no_tail()
         .map_err(Into::into)
 }
@@ -143,7 +145,10 @@ impl FromStr for UpgradeProtocol {
     type Err = UpgradeProtocolError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        protocol()(value.as_bytes()).no_tail().map_err(Into::into)
+        protocol()
+            .parse(value.as_bytes())
+            .no_tail()
+            .map_err(Into::into)
     }
 }
 

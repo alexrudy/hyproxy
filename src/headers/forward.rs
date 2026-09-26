@@ -423,12 +423,12 @@ mod parse {
     use nom::character::complete::char;
     use nom::multi::separated_list1;
     use nom::sequence::separated_pair;
-    use nom::IResult;
 
     use crate::headers::fields::{FieldKey, FieldValue};
     use crate::headers::parser::{key, record, strip_whitespace};
 
-    fn forwarded_key_value<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], (FieldKey, FieldValue)>
+    fn forwarded_key_value<'v>(
+    ) -> impl nom::Parser<&'v [u8], Output = (FieldKey, FieldValue), Error = nom::error::Error<&'v [u8]>>
     {
         separated_pair(
             strip_whitespace(key()),
@@ -439,8 +439,9 @@ mod parse {
 
     pub type ForwardedRecord = Vec<(FieldKey, FieldValue)>;
 
-    pub(super) fn forwarded_record<'a>(
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], ForwardedRecord> {
+    pub(super) fn forwarded_record<'v>(
+    ) -> impl nom::Parser<&'v [u8], Output = ForwardedRecord, Error = nom::error::Error<&'v [u8]>>
+    {
         separated_list1(char(';'), forwarded_key_value())
     }
 }
@@ -449,8 +450,10 @@ impl Forwarded {
     fn parse_bytes(value: &[u8]) -> Result<Vec<Record<Self>>, ParseForwardedError> {
         use nom::character::complete::char;
         use nom::multi::separated_list0;
+        use nom::Parser;
 
-        separated_list0(char(','), self::parse::forwarded_record())(value)
+        separated_list0(char(','), self::parse::forwarded_record())
+            .parse(value)
             .finish()
             .no_tail()
             .map_err(|error| ParseForwardedError {
@@ -531,7 +534,9 @@ impl Forwarded {
     where
         Self: Sized,
     {
-        let records = parse::forwarded_record()(value)
+        use nom::Parser;
+        let records = parse::forwarded_record()
+            .parse(value)
             .finish()
             .no_tail()
             .map_err(|error| ParseForwardedError {

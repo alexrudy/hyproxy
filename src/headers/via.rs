@@ -16,6 +16,7 @@ use nom::combinator::map_res;
 use nom::combinator::opt;
 use nom::multi::separated_list0;
 use nom::sequence::pair;
+use nom::Parser;
 use thiserror::Error;
 
 use crate::headers::parser::{strip_whitespace, token, NoTail};
@@ -39,7 +40,7 @@ pub struct Via {
     address: ViaAddress,
 }
 
-fn via<'v>() -> impl FnMut(&'v [u8]) -> nom::IResult<&'v [u8], Via> {
+fn via<'v>() -> impl nom::Parser<&'v [u8], Output = Via, Error = nom::error::Error<&'v [u8]>> {
     use nom::sequence::pair;
 
     map(
@@ -52,7 +53,8 @@ impl Via {
     fn parse_bytes(value: &[u8]) -> Result<Vec<Record<Via>>, ParseViaError> {
         let mut parser = separated_list0(char(','), strip_whitespace(via()));
 
-        parser(value)
+        parser
+            .parse(value)
             .no_tail()
             .map_err(|error| {
                 ParseViaError::ParserError(nom::error::Error::new(
@@ -118,7 +120,8 @@ pub struct ViaProtocol {
     version: Token,
 }
 
-fn protocol<'v>() -> impl FnMut(&'v [u8]) -> nom::IResult<&'v [u8], ViaProtocol> {
+fn protocol<'v>(
+) -> impl nom::Parser<&'v [u8], Output = ViaProtocol, Error = nom::error::Error<&'v [u8]>> {
     map(
         pair(opt(pair(strip_whitespace(token()), char('/'))), token()),
         |(name, version)| ViaProtocol {
@@ -131,7 +134,7 @@ fn protocol<'v>() -> impl FnMut(&'v [u8]) -> nom::IResult<&'v [u8], ViaProtocol>
 impl ViaProtocol {
     /// Parse a ViaProtocol from a string.
     pub fn parse_bytes(value: &[u8]) -> Result<Self, ParseViaError> {
-        protocol()(value).no_tail().map_err(|error| {
+        protocol().parse(value).no_tail().map_err(|error| {
             ParseViaError::ParserError(nom::error::Error::new(
                 Bytes::copy_from_slice(error.input),
                 error.code,
@@ -181,7 +184,8 @@ impl From<http::Version> for ViaProtocol {
     }
 }
 
-fn address<'v>() -> impl FnMut(&'v [u8]) -> nom::IResult<&'v [u8], ViaAddress> {
+fn address<'v>(
+) -> impl nom::Parser<&'v [u8], Output = ViaAddress, Error = nom::error::Error<&'v [u8]>> {
     let port = map_res(pair(char::<&[u8], _>(':'), digit1), |(_, port)| {
         std::str::from_utf8(port)
             .map_err(|_| nom::error::Error::new(port, nom::error::ErrorKind::Digit))
@@ -229,7 +233,7 @@ impl ViaAddress {
 
     /// Parse a ViaAddress from a sequence of HTTP header bytes.
     pub fn parse_bytes(value: &[u8]) -> Result<Self, ParseViaError> {
-        address()(value).no_tail().map_err(|error| {
+        address().parse(value).no_tail().map_err(|error| {
             ParseViaError::ParserError(nom::error::Error::new(
                 Bytes::copy_from_slice(error.input),
                 error.code,
