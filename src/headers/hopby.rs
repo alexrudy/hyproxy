@@ -1,6 +1,7 @@
 //! Middleware to handle the Hop-by-Hop headers.
 
-const HOPBYHOP: [http::header::HeaderName; 5] = [
+/// List of hop-by-hop headers which are normally stripped by proxies.
+pub const HOPBYHOP: [http::header::HeaderName; 5] = [
     http::header::PROXY_AUTHENTICATE,
     http::header::PROXY_AUTHORIZATION,
     http::header::TE,
