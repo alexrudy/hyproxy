@@ -28,8 +28,9 @@ bytes = "1"
 hyper = { version = "1", optional = true }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"]}
+tower = { version = "0.5", features = ["util", "limit", "timeout"]}
 tokio = { version = "1", features = ["macros", "rt"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
 
 [package.metadata.docs.rs]
 # Document feature-gated items such as `upgrade` and `ConnectionInfoAdapter`.

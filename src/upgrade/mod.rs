@@ -9,8 +9,10 @@
 //!
 //! # Requirements
 //!
-//! - **A Tokio runtime.** The connections are joined in a task started with
-//!   [`tokio::spawn`], so the service must be called from within a Tokio runtime.
+//! - **An executor.** Each upgraded connection runs in a separate [`TunnelTask`]. By default
+//!   it is started with [`tokio::spawn`] (see [`TokioExecutor`]), so the service must be
+//!   called from within a Tokio runtime. Use [`ProxyUpgradeLayer::executor`] to provide
+//!   any [`hyper::rt::Executor`] instead.
 //! - **Hyper connections on both sides.** The request must come from a hyper server, and the
 //!   response from a hyper client, as `ProxyUpgrade` uses [`hyper::upgrade::on`] on both.
 //! - **Upgrade headers must be forwarded.** `Connection` and `Upgrade` are hop-by-hop headers.
@@ -36,6 +38,33 @@
 //!
 //! When an upgrade is requested, the parsed [`UpgradeRequest`] is also inserted into the
 //! request extensions for the inner service.
+//!
+//! # Controlling upgraded connections
+//!
+//! Each upgraded connection is run by a tower service, which is called with a [`Tunnel`]:
+//! the client and upstream connections, the agreed protocol, and the request and response
+//! which upgraded them. The default, [`CopyBidirectional`], copies data in both directions
+//! until both sides close. Wrap it in middleware to limit or observe upgraded connections.
+//! For example, to allow at most 100 at a time, and close each after an hour:
+//!
+//! ```
+//! use std::time::Duration;
+//!
+//! use hyproxy::upgrade::{CopyBidirectional, ProxyUpgradeLayer};
+//!
+//! let tunnel = tower::ServiceBuilder::new()
+//!     .concurrency_limit(100)
+//!     .timeout(Duration::from_secs(60 * 60))
+//!     .service(CopyBidirectional::new());
+//!
+//! let layer = ProxyUpgradeLayer::new().tunnel(tunnel);
+//! # let _ = layer;
+//! ```
+//!
+//! The tunnel service is cloned for each connection, and is only polled for readiness once
+//! the `101 Switching Protocols` response has been returned to the client. A limit like the
+//! one above therefore delays the start of copying, rather than rejecting the upgrade.
+//! Errors from the tunnel service are logged at `debug`.
 
 use core::fmt;
 use std::ops;
@@ -53,6 +82,13 @@ use thiserror::Error;
 use crate::headers::connection::is_upgrade;
 use crate::headers::fields::Token;
 use crate::headers::parser::{strip_whitespace, token, NoTail as _};
+
+mod tunnel;
+pub use self::tunnel::{
+    CopyBidirectional, CopyBidirectionalFuture, TokioExecutor, Tunnel, TunnelStats, TunnelTask,
+    UpgradedIo,
+};
+
 /// The `Upgrade` header field allows the sender to specify what protocols they would like to upgrade to.
 pub const UPGRADE: http::HeaderName = http::header::UPGRADE;
 
@@ -251,9 +287,12 @@ impl ops::Deref for UpgradeRequest {
 }
 
 /// Layer to facilitate upgrades across reverse proxy boundaries.
+///
+/// See [`ProxyUpgrade`] for the tunnel service and executor.
 #[derive(Clone, Debug)]
-pub struct ProxyUpgradeLayer {
-    _priv: (),
+pub struct ProxyUpgradeLayer<T = CopyBidirectional, E = TokioExecutor> {
+    tunnel: T,
+    executor: E,
 }
 
 impl Default for ProxyUpgradeLayer {
@@ -263,43 +302,110 @@ impl Default for ProxyUpgradeLayer {
 }
 
 impl ProxyUpgradeLayer {
-    /// Create a new `ProxyUpgradeLayer`.
+    /// Create a new `ProxyUpgradeLayer`, which runs upgrades with [`CopyBidirectional`] in
+    /// tasks started with [`tokio::spawn`].
     pub fn new() -> Self {
-        Self { _priv: () }
+        Self {
+            tunnel: CopyBidirectional::new(),
+            executor: TokioExecutor::new(),
+        }
     }
 }
 
-impl<S> tower::layer::Layer<S> for ProxyUpgradeLayer {
-    type Service = ProxyUpgrade<S>;
+impl<T, E> ProxyUpgradeLayer<T, E> {
+    /// Set the service which runs each upgraded connection.
+    pub fn tunnel<T2>(self, tunnel: T2) -> ProxyUpgradeLayer<T2, E> {
+        ProxyUpgradeLayer {
+            tunnel,
+            executor: self.executor,
+        }
+    }
+
+    /// Set the executor which runs each upgraded connection's [`TunnelTask`].
+    pub fn executor<E2>(self, executor: E2) -> ProxyUpgradeLayer<T, E2> {
+        ProxyUpgradeLayer {
+            tunnel: self.tunnel,
+            executor,
+        }
+    }
+}
+
+impl<S, T: Clone, E: Clone> tower::layer::Layer<S> for ProxyUpgradeLayer<T, E> {
+    type Service = ProxyUpgrade<S, T, E>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        ProxyUpgrade::new(inner)
+        ProxyUpgrade {
+            inner,
+            tunnel: self.tunnel.clone(),
+            executor: self.executor.clone(),
+        }
     }
 }
 
 /// Middleware to facilitate upgrades across reverse proxy boundaries.
+///
+/// When an upgrade succeeds, `ProxyUpgrade` builds a [`TunnelTask`] and hands it to the
+/// executor (by default, [`TokioExecutor`]). The task waits for both connections to
+/// upgrade, then calls a clone of the tunnel service (by default, [`CopyBidirectional`])
+/// with a [`Tunnel`].
+///
+/// The tunnel service is only checked for readiness inside the task, after the `101
+/// Switching Protocols` response has been returned to the client, so it does not hold up
+/// other requests. Errors from the tunnel service are logged at `debug`; use middleware on
+/// the tunnel service to handle them in some other way.
 #[derive(Clone, Debug)]
-pub struct ProxyUpgrade<S> {
+pub struct ProxyUpgrade<S, T = CopyBidirectional, E = TokioExecutor> {
     inner: S,
+    tunnel: T,
+    executor: E,
 }
 
 impl<S> ProxyUpgrade<S> {
-    /// Create a new `ProxyUpgrade` middleware.
+    /// Create a new `ProxyUpgrade` middleware, which runs upgrades with
+    /// [`CopyBidirectional`] in tasks started with [`tokio::spawn`].
     pub fn new(inner: S) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            tunnel: CopyBidirectional::new(),
+            executor: TokioExecutor::new(),
+        }
     }
 }
 
-impl<S, BIn, BOut> tower::Service<http::Request<BIn>> for ProxyUpgrade<S>
+impl<S, T, E> ProxyUpgrade<S, T, E> {
+    /// Set the service which runs each upgraded connection.
+    pub fn tunnel<T2>(self, tunnel: T2) -> ProxyUpgrade<S, T2, E> {
+        ProxyUpgrade {
+            inner: self.inner,
+            tunnel,
+            executor: self.executor,
+        }
+    }
+
+    /// Set the executor which runs each upgraded connection's [`TunnelTask`].
+    pub fn executor<E2>(self, executor: E2) -> ProxyUpgrade<S, T, E2> {
+        ProxyUpgrade {
+            inner: self.inner,
+            tunnel: self.tunnel,
+            executor,
+        }
+    }
+}
+
+impl<S, T, E, BIn, BOut> tower::Service<http::Request<BIn>> for ProxyUpgrade<S, T, E>
 where
     S: tower::Service<http::Request<BIn>, Response = http::Response<BOut>>,
+    T: tower::Service<Tunnel<UpgradedIo, UpgradedIo>> + Clone + Send + 'static,
+    T::Future: Send,
+    T::Error: Into<tower::BoxError>,
+    E: hyper::rt::Executor<TunnelTask> + Clone,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = self::future::UpgradableProxyFuture<S::Future>;
+    type Future = self::future::UpgradableProxyFuture<S::Future, T, E>;
 
     fn call(&mut self, mut request: http::Request<BIn>) -> Self::Future {
-        let upgrade = self::future::Upgrade::new(&mut request);
+        let upgrade = self::future::Upgrade::new(&mut request, &self.tunnel, &self.executor);
         let inner = self.inner.call(request);
         self::future::UpgradableProxyFuture::new(inner, upgrade)
     }
@@ -316,23 +422,48 @@ mod future {
 
     use std::task::ready;
 
-    #[cfg(not(feature = "hyperdriver"))]
-    use crate::bridge::TokioIo;
-    #[cfg(feature = "hyperdriver")]
-    use hyperdriver::bridge::io::TokioIo;
-
-    use tokio::io::copy_bidirectional;
+    use hyper::upgrade::OnUpgrade;
 
     use super::*;
 
+    /// What is needed to start a tunnel, captured from a request which asked to upgrade.
     #[derive(Debug)]
-    pub(super) struct Upgrade {
-        protocol: Option<UpgradeRequest>,
-        on: Option<hyper::upgrade::OnUpgrade>,
+    struct Pending<T, E> {
+        on: OnUpgrade,
+        request: http::request::Parts,
+        tunnel: T,
+        executor: E,
     }
 
-    impl Upgrade {
-        pub(super) fn new<B>(request: &mut http::Request<B>) -> Self {
+    #[derive(Debug)]
+    pub(super) struct Upgrade<T, E> {
+        protocol: Option<UpgradeRequest>,
+        pending: Option<Pending<T, E>>,
+    }
+
+    /// Clone everything but the body of a request.
+    fn clone_request_parts<B>(request: &http::Request<B>) -> http::request::Parts {
+        let mut parts = http::Request::new(()).into_parts().0;
+        parts.method = request.method().clone();
+        parts.uri = request.uri().clone();
+        parts.version = request.version();
+        parts.headers = request.headers().clone();
+        parts.extensions = request.extensions().clone();
+        parts
+    }
+
+    /// Clone everything but the body of a response.
+    fn clone_response_parts<B>(response: &http::Response<B>) -> http::response::Parts {
+        let mut parts = http::Response::new(()).into_parts().0;
+        parts.status = response.status();
+        parts.version = response.version();
+        parts.headers = response.headers().clone();
+        parts.extensions = response.extensions().clone();
+        parts
+    }
+
+    impl<T: Clone, E: Clone> Upgrade<T, E> {
+        pub(super) fn new<B>(request: &mut http::Request<B>, tunnel: &T, executor: &E) -> Self {
             let protocol = get_upgrade_request(request.headers())
                 .map(Some)
                 .unwrap_or_else(|error| {
@@ -345,24 +476,42 @@ mod future {
                 request.extensions_mut().insert(protocol.clone());
             }
 
-            let on = hyper::upgrade::on(request);
-            Self {
-                protocol,
-                on: Some(on),
-            }
+            let on = hyper::upgrade::on(&mut *request);
+
+            // Only pay for cloning the request and tunnel when an upgrade is possible.
+            let pending = protocol
+                .as_ref()
+                .filter(|protocols| !protocols.is_empty())
+                .map(|_| Pending {
+                    on,
+                    request: clone_request_parts(request),
+                    tunnel: tunnel.clone(),
+                    executor: executor.clone(),
+                });
+
+            Self { protocol, pending }
         }
     }
 
     pin_project_lite::pin_project! {
-        pub struct UpgradableProxyFuture<F> {
+        /// Future returned by [`ProxyUpgrade`].
+        pub struct UpgradableProxyFuture<F, T, E> {
             #[pin]
             inner: F,
-            request_upgrade: Upgrade,
+            request_upgrade: Upgrade<T, E>,
         }
     }
 
-    impl<F> UpgradableProxyFuture<F> {
-        pub(super) fn new(inner: F, upgrade: Upgrade) -> Self {
+    impl<F, T, E> fmt::Debug for UpgradableProxyFuture<F, T, E> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("UpgradableProxyFuture")
+                .field("protocol", &self.request_upgrade.protocol)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<F, T, E> UpgradableProxyFuture<F, T, E> {
+        pub(super) fn new(inner: F, upgrade: Upgrade<T, E>) -> Self {
             Self {
                 inner,
                 request_upgrade: upgrade,
@@ -370,11 +519,15 @@ mod future {
         }
     }
 
-    impl<F, BOut, E> std::future::Future for UpgradableProxyFuture<F>
+    impl<F, T, E, BOut, Error> std::future::Future for UpgradableProxyFuture<F, T, E>
     where
-        F: std::future::Future<Output = Result<http::Response<BOut>, E>>,
+        F: std::future::Future<Output = Result<http::Response<BOut>, Error>>,
+        T: tower::Service<Tunnel<UpgradedIo, UpgradedIo>> + Send + 'static,
+        T::Future: Send,
+        T::Error: Into<tower::BoxError>,
+        E: hyper::rt::Executor<TunnelTask>,
     {
-        type Output = Result<http::Response<BOut>, E>;
+        type Output = Result<http::Response<BOut>, Error>;
 
         fn poll(
             self: std::pin::Pin<&mut Self>,
@@ -387,60 +540,28 @@ mod future {
                 if response.status() == http::StatusCode::SWITCHING_PROTOCOLS {
                     let request_protocol = this.request_upgrade.protocol.as_ref();
                     let response_protocol = get_upgrade_response(response.headers());
-                    if request_protocol
+                    let matched = request_protocol
                         .zip(response_protocol.as_ref())
                         .is_some_and(|(protocols, response_protocol)| {
                             protocols.matching(response_protocol)
-                        })
-                    {
-                        // The request came from the client; the response from the upstream.
-                        let upstream_upgraded = hyper::upgrade::on(response);
-                        let client_upgraded = this.request_upgrade.on.take().unwrap();
-
-                        tokio::spawn(async move {
-                            let client_io = match client_upgraded.await {
-                                Ok(upgraded) => {
-                                    tracing::debug!("Request upgraded");
-                                    upgraded
-                                }
-                                Err(e) => {
-                                    // Usually the client disconnecting.
-                                    tracing::debug!("Request upgrade failed: {:?}", e);
-                                    return;
-                                }
-                            };
-
-                            let upstream_io = match upstream_upgraded.await {
-                                Ok(upgraded) => {
-                                    tracing::debug!("Response upgraded");
-                                    upgraded
-                                }
-                                Err(e) => {
-                                    // The upstream agreed to upgrade, so this is unexpected.
-                                    tracing::warn!("Response upgrade failed: {:?}", e);
-                                    return;
-                                }
-                            };
-
-                            // Returns (client -> upstream, upstream -> client) byte counts.
-                            match copy_bidirectional(
-                                &mut TokioIo::new(client_io),
-                                &mut TokioIo::new(upstream_io),
-                            )
-                            .await
-                            {
-                                Ok((up, down)) => {
-                                    tracing::debug!(
-                                        "Upgrade complete: {} bytes upstream, {} bytes downstream",
-                                        up,
-                                        down
-                                    );
-                                }
-                                Err(error) => {
-                                    tracing::debug!("Upgrade IO error: {}", error);
-                                }
-                            }
                         });
+
+                    if let (true, Some(protocol), Some(pending)) = (
+                        matched,
+                        response_protocol.clone(),
+                        this.request_upgrade.pending.take(),
+                    ) {
+                        // The request came from the client; the response from the upstream.
+                        let upstream_upgraded = hyper::upgrade::on(&mut *response);
+                        let task = TunnelTask::new(
+                            pending.tunnel,
+                            pending.on,
+                            upstream_upgraded,
+                            protocol,
+                            pending.request,
+                            clone_response_parts(response),
+                        );
+                        pending.executor.execute(task);
                     } else {
                         let protocol_options = request_protocol
                             .map(|p| {
@@ -583,6 +704,191 @@ mod tests {
         assert!(request.matching(&protocol("irc/6.9")));
         assert!(!request.matching(&protocol("irc/7")));
         assert!(!request.matching(&protocol("h2c")));
+    }
+
+    #[tokio::test]
+    async fn copy_bidirectional_copies_both_ways() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tower::ServiceExt as _;
+
+        let (client, mut client_peer) = tokio::io::duplex(64);
+        let (upstream, mut upstream_peer) = tokio::io::duplex(64);
+        let tunnel = Tunnel::new(
+            client,
+            upstream,
+            protocol("echo"),
+            http::Request::new(()).into_parts().0,
+            http::Response::new(()).into_parts().0,
+        );
+        let copy = tokio::spawn(CopyBidirectional::new().oneshot(tunnel));
+
+        client_peer.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        upstream_peer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        upstream_peer.write_all(b"pong!").await.unwrap();
+        let mut buf = [0u8; 5];
+        client_peer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong!");
+
+        drop(client_peer);
+        drop(upstream_peer);
+        let stats = copy.await.unwrap().unwrap();
+        assert_eq!(stats, TunnelStats::new(4, 5));
+    }
+
+    mod e2e {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        use hyper::body::Incoming;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tower::{Layer as _, ServiceExt as _};
+
+        #[cfg(not(feature = "hyperdriver"))]
+        use crate::bridge::TokioIo;
+        #[cfg(feature = "hyperdriver")]
+        use hyperdriver::bridge::io::TokioIo;
+
+        use super::super::*;
+
+        #[derive(Debug, Clone, Default)]
+        struct CountingExecutor(Arc<AtomicUsize>);
+
+        impl hyper::rt::Executor<TunnelTask> for CountingExecutor {
+            fn execute(&self, fut: TunnelTask) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(fut);
+            }
+        }
+
+        /// An upstream which accepts `Upgrade: echo`, then echoes everything back.
+        async fn upstream(
+            mut request: http::Request<Incoming>,
+        ) -> Result<http::Response<String>, hyper::Error> {
+            let on = hyper::upgrade::on(&mut request);
+            tokio::spawn(async move {
+                let mut io = TokioIo::new(on.await.unwrap());
+                let mut buf = [0u8; 64];
+                loop {
+                    let n = io.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    io.write_all(&buf[..n]).await.unwrap();
+                }
+            });
+
+            Ok(http::Response::builder()
+                .status(http::StatusCode::SWITCHING_PROTOCOLS)
+                .header(http::header::CONNECTION, "upgrade")
+                .header(UPGRADE, "echo")
+                .body(String::new())
+                .unwrap())
+        }
+
+        /// Forward a request to a new connection to `upstream`.
+        async fn forward(
+            request: http::Request<Incoming>,
+        ) -> Result<http::Response<Incoming>, hyper::Error> {
+            let (proxy_io, upstream_io) = tokio::io::duplex(1024);
+            tokio::spawn(
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(upstream_io),
+                        hyper::service::service_fn(upstream),
+                    )
+                    .with_upgrades(),
+            );
+
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(TokioIo::new(proxy_io)).await?;
+            tokio::spawn(conn.with_upgrades());
+            sender.send_request(request).await
+        }
+
+        #[tokio::test]
+        async fn proxy_upgrade_runs_tunnel_service_on_executor() {
+            let executor = CountingExecutor::default();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+
+            let recorder = seen.clone();
+            let tunnel = tower::ServiceBuilder::new()
+                .map_request(move |tunnel: Tunnel<UpgradedIo, UpgradedIo>| {
+                    recorder.lock().unwrap().push((
+                        tunnel.protocol().clone(),
+                        tunnel.request().uri.clone(),
+                        tunnel
+                            .request()
+                            .extensions
+                            .get::<UpgradeRequest>()
+                            .is_some(),
+                        tunnel.response().status,
+                    ));
+                    tunnel
+                })
+                .service(CopyBidirectional::new());
+
+            let proxy = ProxyUpgradeLayer::new()
+                .tunnel(tunnel)
+                .executor(executor.clone())
+                .layer(tower::service_fn(forward));
+
+            let (client_io, server_io) = tokio::io::duplex(1024);
+            tokio::spawn(
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(server_io),
+                        hyper::service::service_fn(move |req| proxy.clone().oneshot(req)),
+                    )
+                    .with_upgrades(),
+            );
+
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                .await
+                .unwrap();
+            tokio::spawn(conn.with_upgrades());
+
+            let request = http::Request::builder()
+                .uri("/chat")
+                .header(http::header::HOST, "example.com")
+                .header(http::header::CONNECTION, "Upgrade")
+                .header(UPGRADE, "echo")
+                .body(String::new())
+                .unwrap();
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+
+            let mut io = TokioIo::new(hyper::upgrade::on(response).await.unwrap());
+            io.write_all(b"hello").await.unwrap();
+            let mut buf = [0u8; 5];
+            io.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello");
+
+            assert_eq!(executor.0.load(Ordering::SeqCst), 1);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            let (protocol, uri, has_upgrade_request, status) = &seen[0];
+            assert_eq!(protocol, &"echo".parse::<UpgradeProtocol>().unwrap());
+            assert_eq!(uri.path(), "/chat");
+            assert!(has_upgrade_request);
+            assert_eq!(*status, http::StatusCode::SWITCHING_PROTOCOLS);
+        }
+
+        #[tokio::test]
+        async fn proxy_upgrade_skips_executor_without_upgrade() {
+            let executor = CountingExecutor::default();
+            let proxy =
+                ProxyUpgradeLayer::new()
+                    .executor(executor.clone())
+                    .layer(tower::service_fn(|_: http::Request<()>| async {
+                        Ok::<_, std::convert::Infallible>(http::Response::new(()))
+                    }));
+
+            proxy.oneshot(http::Request::new(())).await.unwrap();
+            assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
