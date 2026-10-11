@@ -2030,6 +2030,10 @@ where
 
 /// A layer which wraps services in [`SetForwardedHeader`], adding a `Forwarded`
 /// header to requests.
+///
+/// Apply [`StripHopByHopLayer`](super::StripHopByHopLayer) outside of this layer, so that a
+/// client cannot use `Connection` to remove the headers it adds. See
+/// [the `hopby` module](super::hopby#ordering).
 #[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
 pub struct SetForwardedHeaderLayer {
     config: ForwardedHeaderConfig,

@@ -277,6 +277,10 @@ impl From<SocketAddr> for ViaAddress {
 }
 
 /// Middleware to add a Via header to requests and responses.
+///
+/// Apply [`StripHopByHopLayer`](super::StripHopByHopLayer) outside of this layer, so that a
+/// client cannot use `Connection` to remove the `Via` header it adds to requests. See
+/// [the `hopby` module](super::hopby#ordering).
 #[derive(Debug, Clone)]
 pub struct SetViaHeaderLayer {
     address: ViaAddress,

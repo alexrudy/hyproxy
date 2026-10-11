@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `StripHopByHop` now reads every `Connection` header line. Previously only the first was used,
+  so headers named on later lines were forwarded.
+- `StripHopByHop` now removes `Keep-Alive`, `Proxy-Connection` and `Upgrade` even when
+  `Connection` does not name them, per RFC 9110 section 7.6.1.
+- `StripHopByHop` no longer removes `Trailer`, which is an end-to-end header announcing the
+  fields in the trailer section.
+- `Connection` header parsing now accepts empty list elements (`a, , b`), and
+  `ConnectionHeader`'s `HeaderRecordKind::into_bytes` no longer panics.
 - `Forwarded` header values that are not valid tokens are now quoted, as required by RFC 7239.
   Previously, IPv4 addresses with a port (`for=192.0.2.1:8080`), hosts with a port
   (`host=example.com:8080`) and IPv6 hosts were emitted unquoted, producing headers that
@@ -46,6 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `StripHopByHop` now takes a `ConnectionHeaders` policy instead of a
+  `preserve_connection` flag, adding `PreserveUpgrade`, which keeps only `Upgrade` and
+  `Connection: upgrade` on upgrade requests and `101 Switching Protocols` responses. To migrate:
+  - `StripHopByHopLayer::new(false)` → `StripHopByHopLayer::new()`
+  - `StripHopByHopLayer::new(true)` →
+    `StripHopByHopLayer::new().connection_headers(ConnectionHeaders::Preserve)`, or
+    `ConnectionHeaders::PreserveUpgrade` to forward only upgrades.
+  - `StripHopByHop::new(inner, preserve)` → `StripHopByHop::new(inner).connection_headers(..)`
+- **Breaking:** `hopby::HOPBYHOP` no longer includes `Trailer`, and is now a `[HeaderName; 4]`.
+- **Breaking:** removed `RemoveConnectionHeaders`, `RemoveConnectionHeadersLayer` and
+  `RemoveConnectionHeadersConfig` from `headers::connection`, which duplicated `StripHopByHop`
+  (and whose `preserve_if_upgrade`/`preserve_if_close` options could not be set). Use
+  `StripHopByHop` with a `ConnectionHeaders` policy instead.
 - **Breaking:** `Forwardee` is now a struct of a `NodeName` and an optional `NodePort`, rather
   than an enum, so that every kind of node can carry a port. To migrate:
   - `Forwardee::Address(addr)` → `Forwardee::address(addr)` (or `Forwardee::from(addr)`)
@@ -102,6 +123,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `hopby::ConnectionHeaders` (also re-exported from `headers`), and the `hopby::CONNECTION_SCOPED`,
+  `hopby::KEEP_ALIVE` and `hopby::PROXY_CONNECTION` constants.
+- `StripHopByHop::{connection_headers, direction, inner, into_inner}` and
+  `StripHopByHopLayer::{connection_headers, direction}`.
+- `hopby::StripDirection`, to strip only requests or only responses. This allows one layer to
+  be placed next to the client and another next to the upstream, so that neither can use
+  `Connection` to remove headers added by the proxy. The default remains to strip both.
 - `FieldValue::to_header_bytes`, which returns the value in its serialized header form,
   retaining the surrounding quotes for quoted strings.
 - `FieldValue::unescaped` and `QuotedText::unescaped`, which return the value with

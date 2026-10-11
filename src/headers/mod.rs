@@ -22,5 +22,5 @@ pub mod via;
 pub use forward::{
     ForwardedHeaderConfig, ForwardeeMode, SetForwardedHeader, SetForwardedHeaderLayer,
 };
-pub use hopby::{StripHopByHop, StripHopByHopLayer};
+pub use hopby::{ConnectionHeaders, StripHopByHop, StripHopByHopLayer};
 pub use via::{SetViaHeader, SetViaHeaderLayer};
