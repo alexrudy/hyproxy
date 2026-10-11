@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ProxyUpgrade` runs each upgraded connection with a tower service, set with `.tunnel(...)`,
+  which is called with a `Tunnel`: the client and upstream connections, the agreed protocol,
+  and the request and response which upgraded them. Wrap the default, `CopyBidirectional`,
+  in middleware to limit or observe upgraded connections.
+- `ProxyUpgrade` starts each upgraded connection as a `TunnelTask` on an executor, set with
+  `.executor(...)`, which can be any `hyper::rt::Executor`. The default is `TokioExecutor`.
+- `upgrade::idle::IdleTimeoutLayer`, tunnel middleware which closes an upgraded connection
+  when no data has moved over it for a duration.
+- `upgrade::limit::DataLimitLayer`, tunnel middleware which limits the data passed over an
+  upgraded connection: in total, and separately from the client to the upstream and from
+  the upstream to the client.
+
+### Changed
+
+- `ProxyUpgradeLayer`, `ProxyUpgrade` and its future are generic over the tunnel service and
+  executor. The defaults keep the previous behavior, so `ProxyUpgradeLayer::new()` and
+  `ProxyUpgrade::new(inner)` are unchanged.
+- Errors from upgraded connections are logged at `debug` by `ProxyUpgrade`; handle them
+  differently with middleware on the tunnel service.
+- The `upgrade` feature enables Tokio's `time` feature, for `IdleTimeout`.
+
 ## [0.13.0](https://github.com/alexrudy/hyproxy/compare/v0.12.0...v0.13.0) - 2026-10-11
 
 ### Other

@@ -28,8 +28,9 @@ bytes = "1"
 hyper = { version = "1", optional = true }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"]}
-tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", features = ["util", "limit", "timeout"]}
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
 
 [package.metadata.docs.rs]
 # Document feature-gated items such as `upgrade` and `ConnectionInfoAdapter`.
@@ -37,4 +38,4 @@ all-features = true
 
 [features]
 hyperdriver = ["dep:hyperdriver", "dep:chateau"]
-upgrade = ["dep:hyper", "tokio/io-util", "tokio/rt"]
+upgrade = ["dep:hyper", "tokio/io-util", "tokio/rt", "tokio/time"]

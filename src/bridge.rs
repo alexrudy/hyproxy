@@ -22,6 +22,11 @@ impl<T> TokioIo<T> {
     pub(crate) fn new(inner: T) -> Self {
         Self { inner }
     }
+
+    /// Consume the wrapper, returning the inner I/O object
+    pub(crate) fn into_inner(self) -> T {
+        self.inner
+    }
 }
 
 impl<T> Deref for TokioIo<T> {
