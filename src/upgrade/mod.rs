@@ -45,16 +45,28 @@
 //! the client and upstream connections, the agreed protocol, and the request and response
 //! which upgraded them. The default, [`CopyBidirectional`], copies data in both directions
 //! until both sides close. Wrap it in middleware to limit or observe upgraded connections.
-//! For example, to allow at most 100 at a time, and close each after an hour:
+//! As well as general tower middleware, this module provides:
+//!
+//! - [`idle::IdleTimeoutLayer`], which closes a connection when no data has moved over it
+//!   for a while.
+//! - [`limit::DataLimitLayer`], which limits the data passed over a connection, in total or
+//!   in each direction.
+//!
+//! For example, to allow at most 100 at a time, and close each after an hour, after five
+//! minutes without traffic, or after 1 GiB of data:
 //!
 //! ```
 //! use std::time::Duration;
 //!
+//! use hyproxy::upgrade::idle::IdleTimeoutLayer;
+//! use hyproxy::upgrade::limit::DataLimitLayer;
 //! use hyproxy::upgrade::{CopyBidirectional, ProxyUpgradeLayer};
 //!
 //! let tunnel = tower::ServiceBuilder::new()
 //!     .concurrency_limit(100)
 //!     .timeout(Duration::from_secs(60 * 60))
+//!     .layer(IdleTimeoutLayer::new(Duration::from_secs(5 * 60)))
+//!     .layer(DataLimitLayer::new(1024 * 1024 * 1024))
 //!     .service(CopyBidirectional::new());
 //!
 //! let layer = ProxyUpgradeLayer::new().tunnel(tunnel);
@@ -83,6 +95,8 @@ use crate::headers::connection::is_upgrade;
 use crate::headers::fields::Token;
 use crate::headers::parser::{strip_whitespace, token, NoTail as _};
 
+pub mod idle;
+pub mod limit;
 mod tunnel;
 pub use self::tunnel::{
     CopyBidirectional, CopyBidirectionalFuture, TokioExecutor, Tunnel, TunnelStats, TunnelTask,
