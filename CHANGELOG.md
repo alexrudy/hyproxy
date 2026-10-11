@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1](https://github.com/alexrudy/hyproxy/compare/v0.13.0...v0.13.1) - 2026-10-11
+
+### Other
+
+- Support idle timeouts and data limits
+- Add better support for tunneled connections.
+
 ### Added
 
 - `ProxyUpgrade` runs each upgraded connection with a tower service, set with `.tunnel(...)`,
