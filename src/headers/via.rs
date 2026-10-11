@@ -32,20 +32,165 @@ pub const VIA: http::header::HeaderName = http::header::VIA;
 /// The `Via` header value, as a chain of proxies.
 pub type ViaChain = HeaderChain<Via>;
 
-/// The `Via` header value.
+/// A single `Via` header entry: one proxy which forwarded the message.
+///
+/// ```text
+/// Via = #( received-protocol RWS received-by [ RWS comment ] )
+/// ```
+///
+/// See [RFC 9110 section 7.6.3](https://datatracker.ietf.org/doc/html/rfc9110#section-7.6.3).
+///
+/// ```
+/// use hyproxy::headers::via::{Via, ViaAddress};
+///
+/// let via = Via::new(http::Version::HTTP_11.into(), ViaAddress::named("proxy").unwrap())
+///     .with_comment("hyproxy")
+///     .unwrap();
+/// assert_eq!(via.to_string(), "1.1 proxy (hyproxy)");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Via {
     protocol: ViaProtocol,
     address: ViaAddress,
+    /// The comment, including the surrounding parentheses, exactly as received.
+    comment: Option<Bytes>,
+}
+
+/// The maximum nesting depth accepted in a `Via` comment, to bound parsing work on
+/// untrusted input.
+const MAX_COMMENT_DEPTH: usize = 16;
+
+/// Parse a `comment` (RFC 9110 section 5.6.5), returning it with its parentheses:
+///
+/// ```text
+/// comment = "(" *( ctext / quoted-pair / comment ) ")"
+/// ctext   = HTAB / SP / %x21-27 / %x2A-5B / %x5D-7E / obs-text
+/// ```
+fn comment(input: &[u8]) -> nom::IResult<&[u8], &[u8]> {
+    let fail = || nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Char));
+    let is_ctext =
+        |c: u8| matches!(c, b'\t' | b' ' | 0x21..=0x27 | 0x2A..=0x5B | 0x5D..=0x7E | 0x80..=0xFF);
+    let is_quotable = |c: u8| matches!(c, b'\t' | b' ' | 0x21..=0x7E | 0x80..=0xFF);
+
+    if input.first() != Some(&b'(') {
+        return Err(fail());
+    }
+
+    let mut depth = 0;
+    let mut bytes = input.iter().enumerate();
+    while let Some((i, &c)) = bytes.next() {
+        match c {
+            b'(' => {
+                depth += 1;
+                if depth > MAX_COMMENT_DEPTH {
+                    return Err(fail());
+                }
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((&input[i + 1..], &input[..=i]));
+                }
+            }
+            b'\\' => match bytes.next() {
+                Some((_, &escaped)) if is_quotable(escaped) => {}
+                _ => return Err(fail()),
+            },
+            c if is_ctext(c) => {}
+            _ => return Err(fail()),
+        }
+    }
+
+    // Unterminated comment.
+    Err(fail())
 }
 
 fn via<'v>() -> impl FnMut(&'v [u8]) -> nom::IResult<&'v [u8], Via> {
-    use nom::sequence::pair;
+    use nom::sequence::tuple;
 
     map(
-        pair(protocol(), strip_whitespace(address())),
-        |(protocol, address)| Via { protocol, address },
+        tuple((
+            protocol(),
+            strip_whitespace(address()),
+            opt(strip_whitespace(comment)),
+        )),
+        |(protocol, address, comment)| Via {
+            protocol,
+            address,
+            comment: comment.map(Bytes::copy_from_slice),
+        },
     )
+}
+
+impl Via {
+    /// Create a `Via` entry for a proxy at `address`, which received the message over
+    /// `protocol`.
+    pub fn new(protocol: ViaProtocol, address: ViaAddress) -> Self {
+        Self {
+            protocol,
+            address,
+            comment: None,
+        }
+    }
+
+    /// Add a comment, typically identifying the proxy software.
+    ///
+    /// The text is given without parentheses. Returns an error if it contains characters
+    /// not permitted in a comment, or unbalanced parentheses.
+    pub fn with_comment(self, comment: &str) -> Result<Self, ParseViaError> {
+        let comment = format!("({comment})");
+        let valid = nom::combinator::all_consuming(self::comment)(comment.as_bytes()).is_ok();
+        if !valid {
+            return Err(ParseViaError::InvalidComment);
+        }
+
+        Ok(Self {
+            comment: Some(Bytes::from(comment)),
+            ..self
+        })
+    }
+
+    /// The protocol the proxy received the message over.
+    pub fn protocol(&self) -> &ViaProtocol {
+        &self.protocol
+    }
+
+    /// The name or address of the proxy.
+    pub fn address(&self) -> &ViaAddress {
+        &self.address
+    }
+
+    /// The comment, without its surrounding parentheses, if any.
+    ///
+    /// Nested comments and escape sequences are returned as received.
+    pub fn comment(&self) -> Option<&[u8]> {
+        self.comment
+            .as_ref()
+            .map(|comment| &comment[1..comment.len() - 1])
+    }
+
+    /// Convert this entry to its header form, e.g. `1.1 proxy (comment)`.
+    pub fn to_bytes(&self) -> Bytes {
+        let mut bytes = BytesMut::new();
+        if let Some(name) = &self.protocol.name {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.put_u8(b'/');
+        }
+        bytes.extend_from_slice(self.protocol.version.as_bytes());
+        bytes.put_u8(b' ');
+        bytes.extend_from_slice(&self.address.clone().into_bytes());
+        if let Some(comment) = &self.comment {
+            bytes.put_u8(b' ');
+            bytes.extend_from_slice(comment);
+        }
+        bytes.freeze()
+    }
+}
+
+impl std::fmt::Display for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&String::from_utf8_lossy(&self.to_bytes()))
+    }
 }
 
 impl Via {
@@ -72,15 +217,7 @@ impl HeaderRecordKind for Via {
     type Error = ParseViaError;
 
     fn into_bytes(self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        if let Some(name) = &self.protocol.name {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'/');
-        }
-        bytes.extend_from_slice(Token::as_bytes(&self.protocol.version));
-        bytes.push(b' ');
-        bytes.extend_from_slice(self.address.into_bytes().as_ref());
-        bytes
+        self.to_bytes().to_vec()
     }
 
     fn parse_header_value(
@@ -109,6 +246,10 @@ pub enum ParseViaError {
     /// The header contains characters in an invalid encoding.
     #[error("Header Encoding")]
     HeaderEncoding,
+
+    /// A comment contains characters which are not permitted, or unbalanced parentheses.
+    #[error("invalid comment in Via header")]
+    InvalidComment,
 }
 
 /// The protocol used by the proxy.
@@ -129,6 +270,23 @@ fn protocol<'v>() -> impl FnMut(&'v [u8]) -> nom::IResult<&'v [u8], ViaProtocol>
 }
 
 impl ViaProtocol {
+    /// Create a protocol from its name and version.
+    ///
+    /// The name is usually omitted (`None`) for HTTP, as RFC 9110 recommends.
+    pub fn new(name: Option<Token>, version: Token) -> Self {
+        Self { name, version }
+    }
+
+    /// The protocol name, if given. `None` means HTTP.
+    pub fn name(&self) -> Option<&Token> {
+        self.name.as_ref()
+    }
+
+    /// The protocol version.
+    pub fn version(&self) -> &Token {
+        &self.version
+    }
+
     /// Parse a ViaProtocol from a string.
     pub fn parse_bytes(value: &[u8]) -> Result<Self, ParseViaError> {
         protocol()(value).no_tail().map_err(|error| {
@@ -154,29 +312,25 @@ impl PartialEq for ViaProtocol {
 }
 
 impl From<http::Version> for ViaProtocol {
+    /// The protocol name is omitted, since it is HTTP (RFC 9110 section 7.6.3).
     fn from(version: http::Version) -> Self {
-        match version {
-            http::Version::HTTP_09 => ViaProtocol {
-                name: Some(Token::from_static("HTTP")),
-                version: Token::from_static("0.9"),
-            },
-            http::Version::HTTP_10 => ViaProtocol {
-                name: Some(Token::from_static("HTTP")),
-                version: Token::from_static("1.0"),
-            },
-            http::Version::HTTP_11 => ViaProtocol {
-                name: Some(Token::from_static("HTTP")),
-                version: Token::from_static("1.1"),
-            },
-            http::Version::HTTP_2 => ViaProtocol {
-                name: Some(Token::from_static("HTTP")),
-                version: Token::from_static("2"),
-            },
-            http::Version::HTTP_3 => ViaProtocol {
-                name: Some(Token::from_static("HTTP")),
-                version: Token::from_static("3"),
-            },
-            _ => panic!("Unexpected protocol: {version:?}"),
+        let version = match version {
+            http::Version::HTTP_09 => Token::from_static_unchecked("0.9"),
+            http::Version::HTTP_10 => Token::from_static_unchecked("1.0"),
+            http::Version::HTTP_11 => Token::from_static_unchecked("1.1"),
+            http::Version::HTTP_2 => Token::from_static_unchecked("2"),
+            http::Version::HTTP_3 => Token::from_static_unchecked("3"),
+            // `http::Version` may gain variants; its `Debug` form is `HTTP/<version>`.
+            other => {
+                let debug = format!("{other:?}");
+                Token::parse(debug.strip_prefix("HTTP/").unwrap_or(&debug).as_bytes())
+                    .unwrap_or_else(|_| Token::from_static_unchecked("unknown"))
+            }
+        };
+
+        ViaProtocol {
+            name: None,
+            version,
         }
     }
 }
@@ -377,10 +531,7 @@ where
     type Future = self::future::ViaHeaderFuture<S::Future, BOut, S::Error>;
 
     fn call(&mut self, mut request: http::Request<BIn>) -> Self::Future {
-        let via = Via {
-            protocol: request.version().into(),
-            address: self.address.clone(),
-        };
+        let via = Via::new(request.version().into(), self.address.clone());
 
         ViaChain::append_record(&self.request, via, request.headers_mut());
 
@@ -444,10 +595,7 @@ mod future {
             let mut response = ready!(this.inner.poll(cx));
 
             if let Ok(res) = &mut response {
-                let via = Via {
-                    protocol: res.version().into(),
-                    address: this.address.clone(),
-                };
+                let via = Via::new(res.version().into(), this.address.clone());
 
                 HeaderChain::append_record(this.mode, via, res.headers_mut());
             }
@@ -466,6 +614,124 @@ mod tests {
     use crate::headers::chain::{Header, IntoRecordValue};
 
     use super::*;
+
+    fn parse_single(input: &[u8]) -> Via {
+        let mut records = Via::parse_bytes(input).unwrap();
+        assert_eq!(records.len(), 1);
+        records.pop().unwrap().into_value().unwrap()
+    }
+
+    #[test]
+    fn parse_via_comments() {
+        for (input, comment) in [
+            (&b"1.1 varnish (Varnish/6.0)"[..], &b"Varnish/6.0"[..]),
+            (b"1.1 proxy:8080 (Apache/2.4 (Unix))", b"Apache/2.4 (Unix)"),
+            (b"1.1 proxy (escaped \\) paren)", b"escaped \\) paren"),
+            (b"1.1 proxy ()", b""),
+            (b"1.1 proxy(no space)", b"no space"),
+        ] {
+            let via = parse_single(input);
+            assert_eq!(
+                via.comment(),
+                Some(comment),
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+            // Comments are preserved when the header is re-serialized.
+            let reparsed = parse_single(&via.to_bytes());
+            assert_eq!(reparsed.comment(), Some(comment));
+        }
+
+        // A comma inside a comment does not split the list.
+        let records = Via::parse_bytes(b"1.1 a (x, y), 1.0 b").unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].value().unwrap().comment(), Some(&b"x, y"[..]));
+    }
+
+    #[test]
+    fn parse_via_invalid_comments() {
+        let deep = format!(
+            "1.1 proxy {}{}",
+            "(".repeat(MAX_COMMENT_DEPTH + 1),
+            ")".repeat(MAX_COMMENT_DEPTH + 1)
+        );
+        for input in [
+            &b"1.1 proxy (unterminated"[..],
+            b"1.1 proxy (unbalanced))",
+            b"1.1 proxy (bad escape \\",
+            deep.as_bytes(),
+        ] {
+            assert!(
+                Via::parse_bytes(input).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+
+        let ok = format!(
+            "1.1 proxy {}{}",
+            "(".repeat(MAX_COMMENT_DEPTH),
+            ")".repeat(MAX_COMMENT_DEPTH)
+        );
+        assert!(Via::parse_bytes(ok.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn via_constructors_and_accessors() {
+        let via = Via::new(
+            http::Version::HTTP_2.into(),
+            ViaAddress::named("proxy").unwrap(),
+        );
+        assert_eq!(via.protocol().name(), None);
+        assert_eq!(via.protocol().version().as_bytes(), b"2");
+        assert_eq!(via.address(), &ViaAddress::named("proxy").unwrap());
+        assert_eq!(via.comment(), None);
+        assert_eq!(via.to_string(), "2 proxy");
+
+        let via = via.with_comment("hyproxy (beta)").unwrap();
+        assert_eq!(via.comment(), Some(&b"hyproxy (beta)"[..]));
+        assert_eq!(via.to_string(), "2 proxy (hyproxy (beta))");
+
+        for invalid in ["unbalanced (", "unbalanced )", "line\nbreak"] {
+            assert!(
+                Via::new(
+                    http::Version::HTTP_11.into(),
+                    ViaAddress::named("p").unwrap()
+                )
+                .with_comment(invalid)
+                .is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        let protocol = ViaProtocol::new(Some(Token::from_static("FOO")), Token::from_static("1"));
+        assert_eq!(protocol.name(), Some(&Token::from_static("FOO")));
+        assert_eq!(
+            Via::new(protocol, ViaAddress::named("p").unwrap()).to_string(),
+            "FOO/1 p"
+        );
+    }
+
+    #[test]
+    fn via_protocol_from_version_omits_http() {
+        // RFC 9110 section 7.6.3: "the protocol-name is omitted when the received protocol is HTTP".
+        for (version, expected) in [
+            (http::Version::HTTP_09, "0.9"),
+            (http::Version::HTTP_10, "1.0"),
+            (http::Version::HTTP_11, "1.1"),
+            (http::Version::HTTP_2, "2"),
+            (http::Version::HTTP_3, "3"),
+        ] {
+            let protocol = ViaProtocol::from(version);
+            assert_eq!(protocol.name(), None);
+            assert_eq!(protocol.version().as_bytes(), expected.as_bytes());
+            // Still equal to the explicit `HTTP/<version>` form.
+            assert_eq!(
+                protocol,
+                ViaProtocol::parse_bytes(format!("HTTP/{expected}").as_bytes()).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn via_address_from_socket_addr() {
@@ -523,20 +789,20 @@ mod tests {
 
         assert_eq!(
             addr,
-            Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: ViaAddress::HostAndPort(Token::from_static("localhost"), Some(8080))
-            }
+            Via::new(
+                http::Version::HTTP_11.into(),
+                ViaAddress::HostAndPort(Token::from_static("localhost"), Some(8080))
+            )
         );
 
         let addr = parse_one!(b"http/1.1 proxy");
 
         assert_eq!(
             addr,
-            Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: ViaAddress::named("proxy").unwrap(),
-            }
+            Via::new(
+                http::Version::HTTP_11.into(),
+                ViaAddress::named("proxy").unwrap()
+            )
         );
     }
 
@@ -548,64 +814,64 @@ mod tests {
 
         assert_eq!(
             records[0].value().unwrap(),
-            &Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: ViaAddress::HostAndPort(Token::from_static("localhost"), Some(8080))
-            }
+            &Via::new(
+                http::Version::HTTP_11.into(),
+                ViaAddress::HostAndPort(Token::from_static("localhost"), Some(8080))
+            )
         );
 
         assert_eq!(
             records[1].value().unwrap(),
-            &Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: ViaAddress::named("proxy").unwrap(),
-            }
+            &Via::new(
+                http::Version::HTTP_11.into(),
+                ViaAddress::named("proxy").unwrap()
+            )
         );
 
         let records = Via::parse_bytes(b"1.1 vegur").unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].value().unwrap(),
-            &Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: ViaAddress::named("vegur").unwrap(),
-            }
+            &Via::new(
+                http::Version::HTTP_11.into(),
+                ViaAddress::named("vegur").unwrap()
+            )
         );
 
         let records = Via::parse_bytes(b"1.0 fred, 1.1 p.example.net").unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(
             records[0].value().unwrap(),
-            &Via {
-                protocol: http::Version::HTTP_10.into(),
-                address: ViaAddress::named("fred").unwrap(),
-            }
+            &Via::new(
+                http::Version::HTTP_10.into(),
+                ViaAddress::named("fred").unwrap()
+            )
         );
 
         assert_eq!(
             records[1].value().unwrap(),
-            &Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: ViaAddress::named("p.example.net").unwrap(),
-            }
+            &Via::new(
+                http::Version::HTTP_11.into(),
+                ViaAddress::named("p.example.net").unwrap()
+            )
         );
 
         let records = Via::parse_bytes(b"HTTP/1.1 GWA").unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].value().unwrap(),
-            &Via {
-                protocol: http::Version::HTTP_11.into(),
-                address: ViaAddress::named("GWA").unwrap(),
-            }
+            &Via::new(
+                http::Version::HTTP_11.into(),
+                ViaAddress::named("GWA").unwrap()
+            )
         );
     }
 
     fn via_fixture() -> Via {
-        Via {
-            protocol: http::Version::HTTP_11.into(),
-            address: ViaAddress::HostAndPort(Token::from_static("localhost"), Some(8080)),
-        }
+        Via::new(
+            http::Version::HTTP_11.into(),
+            ViaAddress::HostAndPort(Token::from_static("localhost"), Some(8080)),
+        )
     }
 
     type BoxServiceFuture = Pin<Box<dyn Future<Output = Result<http::Response<()>, Infallible>>>>;
@@ -646,10 +912,7 @@ mod tests {
         let request = http::Request::new(());
         let response = service.oneshot(request).await.unwrap();
 
-        let via = Via {
-            protocol: http::Version::HTTP_11.into(),
-            address: addr.clone(),
-        };
+        let via = Via::new(http::Version::HTTP_11.into(), addr.clone());
 
         let chain: ViaChain = ViaChain::from_headers(response.headers());
 
@@ -670,10 +933,10 @@ mod tests {
         let request = http::Request::new(());
         let response = service.oneshot(request).await.unwrap();
 
-        let via = Via {
-            protocol: http::Version::HTTP_11.into(),
-            address: "localhost:8080".parse().unwrap(),
-        };
+        let via = Via::new(
+            http::Version::HTTP_11.into(),
+            "localhost:8080".parse().unwrap(),
+        );
 
         let chain: ViaChain = ViaChain::from_headers(response.headers());
 
@@ -699,10 +962,10 @@ mod tests {
             .unwrap();
         let response = service.oneshot(request).await.unwrap();
 
-        let via = Via {
-            protocol: http::Version::HTTP_11.into(),
-            address: "localhost:8080".parse().unwrap(),
-        };
+        let via = Via::new(
+            http::Version::HTTP_11.into(),
+            "localhost:8080".parse().unwrap(),
+        );
 
         let chain: ViaChain = ViaChain::from_headers(response.headers());
 

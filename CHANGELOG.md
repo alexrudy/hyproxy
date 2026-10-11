@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProxyUpgrade` now detects upgrade requests from browsers, which send `Connection: Upgrade`
   (capitalised). `Connection` options are compared case-insensitively, as RFC 9110 requires, and
   every `Connection` and `Upgrade` header line is read.
+- `Via` headers with a comment (e.g. `1.1 varnish (Varnish/6.0)`, as sent by Apache and Varnish)
+  now parse, and the comment is preserved when the header is re-serialized. Nesting is limited
+  to 16 levels.
+- `ViaProtocol::from(http::Version)` no longer panics on unrecognised versions.
 - `StripHopByHop` now reads every `Connection` header line. Previously only the first was used,
   so headers named on later lines were forwarded.
 - `StripHopByHop` now removes `Keep-Alive`, `Proxy-Connection` and `Upgrade` even when
@@ -70,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `StripHopByHop::new(inner, preserve)` → `StripHopByHop::new(inner).connection_headers(..)`
 - **Breaking:** `From<SocketAddr> for ViaAddress` is now `TryFrom<SocketAddr>`, as it panicked on
   IPv6 addresses, which are not valid `received-by` tokens under RFC 9110.
+- `SetViaHeader` now omits the protocol name for HTTP (`1.1 proxy` rather than `HTTP/1.1 proxy`),
+  as RFC 9110 section 7.6.3 recommends.
+- **Breaking:** `UpgradeProtocol` equality is now an equivalence relation: a missing version no
+  longer equals every version (previously `websocket/1 == websocket == websocket/2`, but
+  `websocket/1 != websocket/2`). The lenient comparison is available as
+  `UpgradeProtocol::matches`, which `UpgradeRequest::matching` uses, so upgrade matching is
+  unchanged. `UpgradeProtocol` now implements `Eq`.
+- `ProxyUpgrade` logs unparseable client `Upgrade` headers and failed client upgrades at `debug`
+  level, and failed upstream upgrades at `warn`, rather than `error`.
 - The `ProxyUriLayer` and `ProxyUriService` documentation now states that the scheme always
   replaces the request's scheme, rather than only being set when missing.
 - **Breaking:** `hopby::HOPBYHOP` no longer includes `Trailer`, and is now a `[HeaderName; 4]`.
@@ -162,6 +175,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than preserving unparseable header values as raw records.
 - `HeaderChain::{first_record, last_record}`, which return the first or last record across all
   header lines in the chain, skipping empty lines.
+- `Via::{new, with_comment, protocol, address, comment, to_bytes}`, `Display for Via`, and
+  `ViaProtocol::{new, name, version}`, so `Via` entries can be built and inspected.
+- `UpgradeProtocol::matches`.
+- `upgrade` module documentation covering its requirements: a Tokio runtime, hyper on both
+  sides, and `ConnectionHeaders::PreserveUpgrade` when used with `StripHopByHop`.
 - `ConnectionScheme` request extension, used for the `proto` field of the `Forwarded` header.
   `ConnectionInfoAdapter` inserts `ConnectionScheme(https)` when TLS connection info is present.
 

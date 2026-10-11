@@ -1,4 +1,41 @@
 //! Middleware to facilitate upgrades across reverse proxy boundaries.
+//!
+//! [`ProxyUpgrade`] lets a proxy forward HTTP/1.1 protocol upgrades (such as WebSockets).
+//! When a request asks to upgrade (`Connection: upgrade` and an `Upgrade` header), the inner
+//! service is expected to forward it upstream. If the upstream responds with
+//! `101 Switching Protocols` for one of the requested protocols, `ProxyUpgrade` connects the
+//! upgraded client connection to the upgraded upstream connection, and copies data between
+//! them until either side closes.
+//!
+//! # Requirements
+//!
+//! - **A Tokio runtime.** The connections are joined in a task started with
+//!   [`tokio::spawn`], so the service must be called from within a Tokio runtime.
+//! - **Hyper connections on both sides.** The request must come from a hyper server, and the
+//!   response from a hyper client, as `ProxyUpgrade` uses [`hyper::upgrade::on`] on both.
+//! - **Upgrade headers must be forwarded.** `Connection` and `Upgrade` are hop-by-hop headers.
+//!   If you use [`StripHopByHop`](crate::headers::StripHopByHop), configure it with
+//!   [`ConnectionHeaders::PreserveUpgrade`](crate::headers::hopby::ConnectionHeaders) so that
+//!   the upgrade reaches the upstream, and the `101` response's headers reach `ProxyUpgrade`.
+//!   Otherwise upgrades are silently not proxied.
+//!
+//! ```
+//! use hyproxy::headers::hopby::ConnectionHeaders;
+//! use hyproxy::headers::StripHopByHopLayer;
+//! use hyproxy::upgrade::ProxyUpgradeLayer;
+//!
+//! let service = tower::ServiceBuilder::new()
+//!     .layer(ProxyUpgradeLayer::new())
+//!     .layer(StripHopByHopLayer::new().connection_headers(ConnectionHeaders::PreserveUpgrade))
+//!     .service_fn(|req: http::Request<()>| async move {
+//!         // Forward `req` upstream with a hyper client here.
+//!         Ok::<_, std::convert::Infallible>(http::Response::new(()))
+//!     });
+//! # let _ = service;
+//! ```
+//!
+//! When an upgrade is requested, the parsed [`UpgradeRequest`] is also inserted into the
+//! request extensions for the inner service.
 
 use core::fmt;
 use std::ops;
@@ -79,7 +116,11 @@ fn get_upgrade_response(headers: &http::HeaderMap) -> Option<UpgradeProtocol> {
     }
 }
 
-/// A protocol that can be upgraded.
+/// A protocol that can be upgraded to: `protocol-name ["/" protocol-version]`.
+///
+/// Equality compares the name and version case-insensitively, and treats a missing version
+/// as distinct from any version. Use [`UpgradeProtocol::matches`] to also accept a missing
+/// version as matching any version.
 #[derive(Clone)]
 pub struct UpgradeProtocol {
     name: Token,
@@ -88,14 +129,18 @@ pub struct UpgradeProtocol {
 
 impl PartialEq for UpgradeProtocol {
     fn eq(&self, other: &Self) -> bool {
-        if let Some((version, other_version)) = self.version().zip(other.version()) {
-            self.name.eq_ignore_ascii_case(&other.name)
-                && version.eq_ignore_ascii_case(other_version)
-        } else {
-            self.name.eq_ignore_ascii_case(&other.name)
-        }
+        let versions_equal = match (&self.version, &other.version) {
+            (Some(version), Some(other)) => version.eq_ignore_ascii_case(other),
+            (None, None) => true,
+            _ => false,
+        };
+
+        // RFC 9110 section 7.8: recipients SHOULD compare protocol names case-insensitively.
+        self.name.eq_ignore_ascii_case(&other.name) && versions_equal
     }
 }
+
+impl Eq for UpgradeProtocol {}
 
 impl fmt::Debug for UpgradeProtocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -125,6 +170,19 @@ impl UpgradeProtocol {
         self.version.as_ref()
     }
 
+    /// Whether `other` names the same protocol, where a missing version on either side
+    /// matches any version.
+    ///
+    /// For example, `websocket` matches `websocket/13`, but `websocket/13` does not match
+    /// `websocket/12`. Unlike `==`, this is not transitive.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.name.eq_ignore_ascii_case(&other.name)
+            && match (&self.version, &other.version) {
+                (Some(version), Some(other)) => version.eq_ignore_ascii_case(other),
+                _ => true,
+            }
+    }
+
     fn extend_buffer(&self, buffer: &mut BytesMut) {
         buffer.extend_from_slice(self.name.as_bytes());
         if let Some(version) = &self.version {
@@ -149,9 +207,12 @@ pub struct UpgradeRequest {
 }
 
 impl UpgradeRequest {
-    /// Check if the request is expecting a particular protocol
+    /// Check if the request is expecting a particular protocol, using
+    /// [`UpgradeProtocol::matches`].
     pub fn matching(&self, protocol: &UpgradeProtocol) -> bool {
-        self.protocols.contains(protocol)
+        self.protocols
+            .iter()
+            .any(|requested| requested.matches(protocol))
     }
 
     /// Add a protocol to the upgrade request
@@ -275,7 +336,8 @@ mod future {
             let protocol = get_upgrade_request(request.headers())
                 .map(Some)
                 .unwrap_or_else(|error| {
-                    tracing::error!("Unable to parse upgrade protocols from request: {error}");
+                    // Client-supplied, so not worth more than a debug log.
+                    tracing::debug!("Unable to parse upgrade protocols from request: {error}");
                     None
                 });
 
@@ -341,7 +403,8 @@ mod future {
                                     upgraded
                                 }
                                 Err(e) => {
-                                    tracing::error!("Request upgrade failed: {:?}", e);
+                                    // Usually the client disconnecting.
+                                    tracing::debug!("Request upgrade failed: {:?}", e);
                                     return;
                                 }
                             };
@@ -352,7 +415,8 @@ mod future {
                                     upgraded
                                 }
                                 Err(e) => {
-                                    tracing::error!("Response upgrade failed: {:?}", e);
+                                    // The upstream agreed to upgrade, so this is unexpected.
+                                    tracing::warn!("Response upgrade failed: {:?}", e);
                                     return;
                                 }
                             };
@@ -484,6 +548,39 @@ mod tests {
         *request.headers_mut() = upgrade_headers(&["keep-alive, Upgrade"], &["websocket"]);
         let upgrade = service.oneshot(request).await.unwrap().into_body().unwrap();
         assert!(upgrade.matching(&"websocket".parse().unwrap()));
+    }
+
+    fn protocol(s: &str) -> UpgradeProtocol {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn upgrade_protocol_equality_is_an_equivalence() {
+        // Case-insensitive, per RFC 9110 section 7.8.
+        assert_eq!(protocol("WebSocket"), protocol("websocket"));
+        assert_eq!(protocol("h2c/1.0"), protocol("H2C/1.0"));
+
+        // A missing version is distinct from any version, so `==` is transitive.
+        assert_ne!(protocol("websocket"), protocol("websocket/13"));
+        assert_ne!(protocol("websocket/12"), protocol("websocket/13"));
+        assert_ne!(protocol("websocket"), protocol("irc"));
+    }
+
+    #[test]
+    fn upgrade_protocol_matches() {
+        assert!(protocol("websocket").matches(&protocol("websocket/13")));
+        assert!(protocol("websocket/13").matches(&protocol("WEBSOCKET")));
+        assert!(protocol("websocket/13").matches(&protocol("websocket/13")));
+        assert!(!protocol("websocket/12").matches(&protocol("websocket/13")));
+        assert!(!protocol("websocket").matches(&protocol("irc")));
+
+        let request = UpgradeRequest {
+            protocols: vec![protocol("websocket"), protocol("IRC/6.9")],
+        };
+        assert!(request.matching(&protocol("websocket/13")));
+        assert!(request.matching(&protocol("irc/6.9")));
+        assert!(!request.matching(&protocol("irc/7")));
+        assert!(!request.matching(&protocol("h2c")));
     }
 
     #[test]
