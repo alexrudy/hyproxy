@@ -94,7 +94,7 @@ impl HeaderRecordKind for Via {
 /// Error for an invalid Via header.
 #[derive(Debug, Error)]
 pub enum ParseViaError {
-    /// A part of the header is not a valid RFC 7230 token.
+    /// A part of the header is not a valid RFC 9110 token.
     #[error(transparent)]
     InvalidToken(#[from] InvalidValue),
 
@@ -102,7 +102,7 @@ pub enum ParseViaError {
     #[error("parsing error: {0:?}")]
     ParserError(nom::error::Error<Bytes>),
 
-    /// The header has only one (space separated) part, missing either the protocl or the address.
+    /// The header has only one (space separated) part, missing either the protocol or the address.
     #[error("Missing address, only protocol found")]
     MissingAddress,
 
@@ -237,7 +237,7 @@ impl ViaAddress {
         })
     }
 
-    /// Create a ViaAddress from a name/psuedonym.
+    /// Create a ViaAddress from a name/pseudonym.
     pub fn named(name: impl Into<String>) -> Result<Self, InvalidValue> {
         let name = Token::parse(name.into().as_bytes())?;
         Ok(ViaAddress::Pseudonym(name))

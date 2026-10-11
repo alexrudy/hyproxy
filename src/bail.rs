@@ -1,6 +1,11 @@
 //! # Bail out from processing, returning a response early
 //!
-//! Sometimes, instead of returning an error (see `hyperdriver::service::)
+//! Sometimes a middleware needs to stop processing a request and respond
+//! immediately, rather than returning an error (as, for example,
+//! `hyperdriver::service::PreprocessLayer` does). [`BailLayer`] and
+//! [`ServiceBailExt::bail`] run a synchronous preprocessor on each request,
+//! which either passes a (possibly modified) request on to the inner service,
+//! or returns a response directly.
 
 use std::fmt;
 
@@ -9,7 +14,7 @@ use self::future::BailFuture;
 /// Extends services to use the BailService directly from a method.
 pub trait ServiceBailExt {
     /// Provide a pre-processor which returns either `Ok(req)`
-    /// with a moditied request, or `Err(res)` with the desired
+    /// with a modified request, or `Err(res)` with the desired
     /// immediate response. This pre-processor is synchronous.
     fn bail<F>(self, preprocessor: F) -> BailService<Self, F>
     where

@@ -1,4 +1,10 @@
 //! Middleware to handle the Hop-by-Hop headers.
+//!
+//! Hop-by-hop headers describe a single connection, and must not be forwarded by a proxy
+//! ([RFC 9110 section 7.6.1](https://datatracker.ietf.org/doc/html/rfc9110#section-7.6.1)).
+//! [`StripHopByHop`] removes the headers listed in [`HOPBYHOP`] from requests and responses,
+//! along with the `Connection` header and any headers it names, unless `preserve_connection`
+//! is set (for example, to allow an upgrade to be proxied).
 
 /// List of hop-by-hop headers which are normally stripped by proxies.
 pub const HOPBYHOP: [http::header::HeaderName; 5] = [
@@ -46,6 +52,9 @@ pub struct StripHopByHopLayer {
 
 impl StripHopByHopLayer {
     /// Create a new `StripHopByHopLayer`.
+    ///
+    /// If `preserve_connection` is `true`, the `Connection` header and the headers it
+    /// names are left in place.
     pub fn new(preserve_connection: bool) -> Self {
         Self {
             preserve_connection,

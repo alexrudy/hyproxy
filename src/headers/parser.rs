@@ -1,7 +1,7 @@
 //! Parser for header field values.
 //!
 //! Header field values are delimiter separated sequences of tokens and quoted strings,
-//! defined in [RFC 7230](https://tools.ietf.org/html/rfc7230#section-3.2.6).
+//! defined in [RFC 9110 section 5.6](https://datatracker.ietf.org/doc/html/rfc9110#section-5.6) (formerly RFC 7230).
 
 use bytes::{BufMut, Bytes, BytesMut};
 use nom::branch::alt;
@@ -105,7 +105,7 @@ mod test_quoted {
     }
 }
 
-/// Write `value` as an RFC 7230 field value: bare if it is a valid token,
+/// Write `value` as an RFC 9110 field value: bare if it is a valid token,
 /// otherwise as a quoted-string with `"` and `\` escaped.
 pub(crate) fn put_field_value(buf: &mut BytesMut, value: &[u8]) {
     if !value.is_empty() && value.iter().all(|c| is_token(*c)) {

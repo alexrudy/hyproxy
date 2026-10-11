@@ -4,8 +4,15 @@
 //! This module provides a set of types for managing header chains,
 //! and their associated records.
 //!
-//! Header chains follow the spec for [RFC 7230](https://tools.ietf.org/html/rfc7230),
-//! which defines the set of permitted and non-permitted tokens.
+//! Header values are parsed according to the field value rules in
+//! [RFC 9110 section 5.6](https://datatracker.ietf.org/doc/html/rfc9110#section-5.6)
+//! (formerly RFC 7230), which define tokens, quoted strings and lists.
+//!
+//! A [`HeaderChain`] holds every line of a header, each line is a [`Header`],
+//! and each comma-separated entry within a line is a [`Record`]. Records that
+//! fail to parse are kept as raw bytes, so that a proxy can pass through
+//! values it does not understand unchanged. [`AppendHeaderRecordMode`]
+//! controls how a new record is combined with the existing chain.
 
 use std::{fmt::Debug, ops};
 

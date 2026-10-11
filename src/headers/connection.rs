@@ -1,4 +1,8 @@
 //! Handle connection headers.
+//!
+//! The `Connection` header lists connection options, and names other headers which apply only
+//! to the current connection
+//! ([RFC 9110 section 7.6.1](https://datatracker.ietf.org/doc/html/rfc9110#section-7.6.1)).
 
 use std::{collections::HashSet, sync::Arc};
 

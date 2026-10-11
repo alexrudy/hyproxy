@@ -31,6 +31,10 @@ hyper = { version = "1", optional = true }
 tower = { version = "*", features = ["util"]}
 tokio = { version = "1", features = ["macros", "rt"] }
 
+[package.metadata.docs.rs]
+# Document feature-gated items such as `upgrade` and `ConnectionInfoAdapter`.
+all-features = true
+
 [features]
 hyperdriver = ["dep:hyperdriver", "dep:chateau"]
 upgrade = ["dep:hyper", "tokio/io-util", "tokio/rt"]

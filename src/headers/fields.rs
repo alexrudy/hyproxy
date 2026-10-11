@@ -1,7 +1,7 @@
 //! HTTP header field values.
 //!
 //! Header field values are delimiter separated sequences of tokens and quoted strings,
-//! defined in [RFC 7230](https://tools.ietf.org/html/rfc7230#section-3.2.6).
+//! defined in [RFC 9110 section 5.6](https://datatracker.ietf.org/doc/html/rfc9110#section-5.6) (formerly RFC 7230).
 use core::fmt;
 use std::borrow::Cow;
 
@@ -49,7 +49,7 @@ where
         .join([delimiter, b' '].as_slice())
 }
 
-/// A single field value component as defined by RFC-7230.
+/// A single field value component as defined by RFC 9110 section 5.6.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FieldValue(Entry);
 
@@ -139,7 +139,7 @@ impl From<Entry> for FieldValue {
     }
 }
 
-/// A single field value component as defined by RFC-7230.
+/// A single field value component as defined by RFC 9110 section 5.6.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Entry {
     /// Token form
@@ -259,7 +259,7 @@ impl Token {
     /// Create a token from a static string without checking for invalid characters.
     ///
     /// # Safety
-    /// The string must contain only valid token characters, as defined in RFC-7230.
+    /// The string must contain only valid token characters, as defined in RFC 9110 section 5.6.2.
     /// This is NOT all ASCII characters, as some are reserved for delimiters, and does
     /// not support unicode characters.
     pub const fn from_static_unchecked(s: &'static str) -> Self {

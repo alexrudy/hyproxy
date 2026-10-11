@@ -1,7 +1,93 @@
 //! Typed version of the HTTP `Forwarded` header.
 //!
-//! See [RFC-7239](https://datatracker.ietf.org/doc/html/rfc7239)
+//! See [RFC 7239](https://datatracker.ietf.org/doc/html/rfc7239)
 //! for the specification of the `Forwarded` header.
+//!
+//! # Adding a `Forwarded` header
+//!
+//! [`SetForwardedHeaderLayer`] adds a record describing this hop to each request:
+//!
+//! - **`for` and `by`** come from the [`RemoteAddress`] and [`LocalAddress`] request
+//!   extensions, and are emitted according to [`ForwardedHeaderConfig`]. By default `for` is
+//!   `unknown` and `by` is omitted, to avoid revealing addresses.
+//! - **`host`** comes from the `Host` header, or the URI authority (as used by HTTP/2).
+//! - **`proto`** comes from the [`ConnectionScheme`] request extension, or the URI scheme.
+//!
+//! With the `hyperdriver` feature, `ConnectionInfoAdapterLayer` populates these extensions
+//! from hyperdriver's connection info. Otherwise, insert them yourself.
+//!
+//! [`AppendHeaderRecordMode`] controls how the new record is combined with any `Forwarded`
+//! (and, if enabled, `X-Forwarded-*`) headers from upstream. This is a statement of trust:
+//! a proxy at the edge of the network should use [`AppendHeaderRecordMode::KeepLast`] to
+//! discard client-supplied values, while a proxy behind a trusted load balancer can append to
+//! the existing chain. See [`Forwarded::append_x_forwarded_headers`] for how each mode applies
+//! to the `X-Forwarded-*` headers.
+//!
+//! ```
+//! use std::net::SocketAddr;
+//!
+//! use http::uri::Scheme;
+//! use hyproxy::headers::chain::AppendHeaderRecordMode;
+//! use hyproxy::headers::forward::{ConnectionScheme, RemoteAddress, FORWARDED, X_FORWARDED_FOR};
+//! use hyproxy::headers::{ForwardedHeaderConfig, ForwardeeMode, SetForwardedHeaderLayer};
+//! use tower::{Layer, ServiceExt};
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() {
+//! let layer = SetForwardedHeaderLayer::new()
+//!     .config(ForwardedHeaderConfig {
+//!         r#for: ForwardeeMode::Address,
+//!         ..Default::default()
+//!     })
+//!     .append_forwarded_headers(AppendHeaderRecordMode::KeepLast)
+//!     .set_x_headers(true);
+//!
+//! // An inner service which returns the request it received, to show the headers.
+//! let service = layer.layer(tower::service_fn(|req: http::Request<()>| async move {
+//!     Ok::<_, std::convert::Infallible>(req)
+//! }));
+//!
+//! let mut request = http::Request::get("/")
+//!     .header(http::header::HOST, "example.com")
+//!     // Untrusted, so discarded by `KeepLast`.
+//!     .header(FORWARDED, "for=203.0.113.1")
+//!     .body(())
+//!     .unwrap();
+//! let remote: SocketAddr = "192.0.2.60:4711".parse().unwrap();
+//! request.extensions_mut().insert(RemoteAddress(remote.into()));
+//! request.extensions_mut().insert(ConnectionScheme(Scheme::HTTPS));
+//!
+//! let forwarded = service.oneshot(request).await.unwrap();
+//! assert_eq!(
+//!     forwarded.headers()[FORWARDED],
+//!     r#"for="192.0.2.60:4711";host=example.com;proto=https"#
+//! );
+//! assert_eq!(forwarded.headers()[X_FORWARDED_FOR], "192.0.2.60");
+//! # }
+//! ```
+//!
+//! # Parsing `Forwarded` headers
+//!
+//! [`ForwardingChain`] parses every `Forwarded` header line into [`Forwarded`] records, in
+//! order from the client to the closest proxy. Each record's `for` and `by` parameters are
+//! [`Forwardee`] nodes: an IP address, an [`ObfuscatedName`], or `unknown`, each with an
+//! optional port. Values which fail to parse are preserved as raw records, so that they are
+//! passed through unchanged; use [`HeaderChain::try_from_headers`] to reject them instead.
+//!
+//! ```
+//! use hyproxy::headers::forward::{ForwardingChain, FORWARDED};
+//!
+//! let mut headers = http::HeaderMap::new();
+//! headers.insert(
+//!     FORWARDED,
+//!     r#"for=192.0.2.43, for="[2001:db8:cafe::17]:4711";proto=https"#.parse().unwrap(),
+//! );
+//!
+//! let chain = ForwardingChain::try_from_headers(&headers).unwrap();
+//! let closest = chain.last_record().and_then(|record| record.value()).unwrap();
+//! assert_eq!(closest.r#for.as_ref().unwrap().ip(), Some("2001:db8:cafe::17".parse().unwrap()));
+//! assert_eq!(closest.proto.as_ref().unwrap().scheme(), &http::uri::Scheme::HTTPS);
+//! ```
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,7 +107,7 @@ use super::parser::{put_field_value, NoTail};
 
 /// The `Forwarded` header, a standard header for identifying the originating IP address of a client connecting to a web server through a proxy server.
 ///
-/// This header is defined in [RFC-7239](https://datatracker.ietf.org/doc/html/rfc7239).
+/// This header is defined in [RFC 7239](https://datatracker.ietf.org/doc/html/rfc7239).
 pub const FORWARDED: http::HeaderName = http::header::FORWARDED;
 
 /// The `X-Forwarded-For` header, a de-facto standard header for identifying the originating IP
@@ -165,8 +251,8 @@ pub struct LocalAddress(pub ForwardAddress);
 /// request URI's scheme, which describes the request target rather than the
 /// connection, and is usually absent for HTTP/1.1 requests.
 ///
-/// [`ConnectionInfoAdapter`] inserts `https` when TLS connection info is
-/// available. Servers that only accept plaintext connections should insert
+/// With the `hyperdriver` feature, `ConnectionInfoAdapter` inserts `https` when TLS
+/// connection info is available. Servers that only accept plaintext connections should insert
 /// `ConnectionScheme(Scheme::HTTP)` themselves.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ConnectionScheme(pub http::uri::Scheme);
@@ -738,7 +824,7 @@ impl HeaderRecordKind for Forwarded {
 ///
 /// Optional whitespace is tolerated around `;` and `,` (the RFC's own examples
 /// use it), but not around `=`. Empty pairs and empty list elements are accepted
-/// and ignored, as RFC 7230 section 7 requires of recipients.
+/// and ignored, as RFC 9110 section 5.6.1.2 requires of recipients.
 mod parse {
 
     use nom::character::complete::{char, space0};

@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer dropped by `Forwarded::set_header`.
 - Corrected documentation: `X_FORWARDED_FOR` was described as `X-Forwarded-By`, and
   `ForwardedProtocol` cited "RFC-2739" and claimed only `http`/`https` are permitted.
+- docs.rs now builds with all features enabled, so the `upgrade` module and
+  `ConnectionInfoAdapter` appear in the published documentation.
 
 ### Changed
 
