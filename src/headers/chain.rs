@@ -531,7 +531,7 @@ mod header_tests {
 
 /// A record is a single value in a header chain.
 ///
-/// It is usually deliminated by a comma, but can be deliminated
+/// It is usually delimited by a comma, but can be delimited
 /// by any character.
 ///
 /// This record object holds either the parsed value `T`, or a raw
@@ -584,13 +584,13 @@ impl<T> Record<T> {
     /// Create a new record with the given raw header value.
     ///
     /// This is private because it assumes that the raw value consists
-    /// only of bytes that are valid in a header value.
+    /// only of bytes that are valid in a header value. All callers pass the
+    /// bytes of an existing `http::HeaderValue`, which guarantees this.
     fn from_raw(value: Vec<u8>) -> Self {
-        // debug_assert!(
-        //     value.iter().all(|c| is_valid(*c)),
-        //     "Raw header values must be valid header bytes"
-        // );
-        //TODO: Validate bytes?
+        debug_assert!(
+            http::HeaderValue::from_bytes(&value).is_ok(),
+            "raw header records must contain only valid header value bytes"
+        );
 
         Self(RecordEntry::Raw(value))
     }

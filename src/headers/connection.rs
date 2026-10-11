@@ -52,7 +52,7 @@ impl ConnectionHeader {
     }
 }
 
-/// An error occured while parsing connection headers.
+/// An error occurred while parsing connection headers.
 #[derive(Debug, Error)]
 #[error("Failed to parse connection header: {0:?}")]
 pub struct ConnectionHeaderParseError(nom::error::Error<Bytes>);

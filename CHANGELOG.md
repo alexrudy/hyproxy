@@ -39,22 +39,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   produced ambiguous multi-valued headers such as `X-Forwarded-Proto: https, http`.
 - `Forwarded::any` now considers extension parameters, so a record with only extensions is no
   longer dropped by `Forwarded::set_header`.
+- Corrected documentation: `X_FORWARDED_FOR` was described as `X-Forwarded-By`, and
+  `ForwardedProtocol` cited "RFC-2739" and claimed only `http`/`https` are permitted.
 
 ### Changed
 
 - **Breaking:** `Forwardee` is now a struct of a `NodeName` and an optional `NodePort`, rather
   than an enum, so that every kind of node can carry a port. To migrate:
   - `Forwardee::Address(addr)` → `Forwardee::address(addr)` (or `Forwardee::from(addr)`)
-  - `Forwardee::Named(token)` → `Forwardee::obfuscated(token)`
+  - `Forwardee::Named(token)` → `Forwardee::obfuscated(ObfuscatedName::try_from(token)?)`
   - `Forwardee::Unknown` → `Forwardee::unknown()`
   - Matching on variants → `forwardee.name()` / `forwardee.port()`, or `forwardee.ip()` for
     the IP address.
-- **Breaking:** `ForwardeeMode::Named` has been renamed to `ForwardeeMode::Obfuscated`, matching
-  the RFC 7239 terminology and `NodeName::Obfuscated`.
+- **Breaking:** `ForwardeeMode::Named(Token)` has been renamed to
+  `ForwardeeMode::Obfuscated(ObfuscatedName)`, matching the RFC 7239 terminology and
+  `NodeName::Obfuscated`. Names are now validated against the `obfnode` grammar when the
+  `ObfuscatedName` is constructed, rather than producing an invalid header; use
+  `ObfuscatedName::from_static("name")` (checked at compile time in a `const`) or
+  `ObfuscatedName::try_from(token)` to migrate.
 - **Breaking:** `ForwardedHost`'s `FromStr::Err` is now `ParseForwardedError` (was
   `http::uri::InvalidUri`). Host values containing userinfo (`user@example.com`) are now
   rejected rather than having the userinfo silently dropped, as the `Host` header grammar
   does not permit it.
+- **Breaking:** methods which allocate a new header value or byte buffer now consistently use
+  the `to_` prefix, per the Rust API guidelines:
+  - `ForwardAddress::as_header_value` → `to_header_value`
+  - `ForwardedProtocol::as_bytes` → `to_bytes`
+  - `XForwardee::header_value` → `to_header_value`
+  - `XForwardedHost::as_header_value` → `to_header_value`
+  - `XForwardedProtocol::as_header_value` → `to_header_value`
+- `ParseForwardedError` and `ForwardParseError` now forward `Error::source` to the underlying
+  error (e.g. `http::uri::InvalidUri`), rather than hiding it. A `proto` value that is not a
+  valid scheme now reports its `InvalidUri` as the source.
+- `ConnectionInfoAdapter` now logs a missing `ConnectionInfo` at `debug` level rather than
+  `warn`, as it is expected for some transports and would otherwise log on every request.
 - `proto` in `Forwarded::new` now prefers the new `ConnectionScheme` request extension over the
   request URI's scheme, since the URI scheme describes the request target rather than the
   connection, and is absent for most HTTP/1.1 requests.
@@ -73,7 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency of `hyperdriver`), to read TLS connection info.
 - `ForwardAddress::from_str` now rejects nodes that are valid but cannot be represented as an IP
   address with a numeric port (e.g. `unknown`, `_hidden`, or an obfuscated port).
-- `ForwardAddress::to_bytes`, `ForwardAddress::as_header_value` and `ForwardAddress`'s `Display`
+- `ForwardAddress::to_bytes`, `ForwardAddress::to_header_value` and `ForwardAddress`'s `Display`
   implementation now quote IPv4 addresses that include a port (`"192.0.2.1:8080"`).
 - `Forwarded` parsing no longer accepts whitespace around `=` (`for = unknown`), which RFC 7239
   does not permit. Such headers are preserved as raw, unparsed records.
@@ -86,11 +104,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retaining the surrounding quotes for quoted strings.
 - `FieldValue::unescaped` and `QuotedText::unescaped`, which return the value with
   `quoted-pair` escape sequences decoded.
+- `ObfuscatedName`, a validated RFC 7239 obfuscated identifier (`obfnode` / `obfport`), used by
+  `NodeName::Obfuscated`, `NodePort::Obfuscated` and `ForwardeeMode::Obfuscated`.
 - `NodeName` and `NodePort` types, and `Forwardee::{new, address, obfuscated, unknown, name, port,
   ip, with_port, without_port}`.
 - `FromStr` and `Display` for `Forwardee`, `NodeName` and `NodePort`.
 - `Forwarded::append_x_forwarded_headers`, which sets the `X-Forwarded-*` headers according to an
   `AppendHeaderRecordMode`.
+- `Forwarded::{with_by, with_for, with_host, with_proto, with_extension}` builder methods, since
+  `Forwarded` is `#[non_exhaustive]` and cannot be constructed with a struct literal outside
+  this crate.
+- `SetForwardedHeader::{set_x_headers, append_forwarded_headers, inner, into_inner}`, matching
+  the configuration available on `SetForwardedHeaderLayer`.
 - `ConnectionScheme` request extension, used for the `proto` field of the `Forwarded` header.
   `ConnectionInfoAdapter` inserts `ConnectionScheme(https)` when TLS connection info is present.
 

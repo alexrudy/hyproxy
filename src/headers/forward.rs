@@ -24,7 +24,7 @@ use super::parser::{put_field_value, NoTail};
 /// This header is defined in [RFC-7239](https://datatracker.ietf.org/doc/html/rfc7239).
 pub const FORWARDED: http::HeaderName = http::header::FORWARDED;
 
-/// The `X-Forwarded-By` header, a de-facto standard header for identifying the originating IP
+/// The `X-Forwarded-For` header, a de-facto standard header for identifying the originating IP
 /// address of a client connecting to a web server through a proxy server. It has been replaced by `Forwarded`.
 pub const X_FORWARDED_FOR: http::HeaderName =
     http::header::HeaderName::from_static("x-forwarded-for");
@@ -250,7 +250,8 @@ mod info {
                     req.extensions_mut().insert(LocalAddress(local.into()));
                 }
             } else {
-                tracing::warn!("Connection info not found")
+                // Common for e.g. in-memory transports or tests, so not worth a warning per request.
+                tracing::debug!("connection info not found in request extensions");
             }
 
             if req.extensions().get::<TlsConnectionInfo>().is_some() {
@@ -266,6 +267,24 @@ mod info {
 /// The contents of one record in a `Forwarded` header.
 ///
 /// A forwarded header can consist of multiple comma-separated records, each containing a set of key-value pairs.
+///
+/// This type is `#[non_exhaustive]`, so construct it with [`Default`] and the `with_*` methods:
+///
+/// ```
+/// use std::net::{IpAddr, Ipv4Addr};
+/// use hyproxy::headers::forward::{Forwarded, Forwardee};
+///
+/// let forwarded = Forwarded::default()
+///     .with_for(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 60)))
+///     .with_by(Forwardee::unknown())
+///     .with_host("example.com".parse().unwrap())
+///     .with_proto(http::uri::Scheme::HTTPS);
+///
+/// assert_eq!(
+///     forwarded.to_header_value(),
+///     "by=unknown;for=192.0.2.60;host=example.com;proto=https"
+/// );
+/// ```
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct Forwarded {
@@ -356,6 +375,58 @@ impl Forwarded {
         Self { by: None, ..self }
     }
 
+    /// Set the `by` field: the interface where the request came in to the proxy.
+    pub fn with_by(self, by: impl Into<Forwardee>) -> Self {
+        Self {
+            by: Some(by.into()),
+            ..self
+        }
+    }
+
+    /// Set the `for` field: the client that initiated the request.
+    pub fn with_for(self, r#for: impl Into<Forwardee>) -> Self {
+        Self {
+            r#for: Some(r#for.into()),
+            ..self
+        }
+    }
+
+    /// Set the `host` field: the original `Host` requested by the client.
+    pub fn with_host(self, host: ForwardedHost) -> Self {
+        Self {
+            host: Some(host),
+            ..self
+        }
+    }
+
+    /// Set the `proto` field: the protocol the request arrived on.
+    pub fn with_proto(self, proto: impl Into<ForwardedProtocol>) -> Self {
+        Self {
+            proto: Some(proto.into()),
+            ..self
+        }
+    }
+
+    /// Add an extension parameter, replacing any existing value for `key`.
+    ///
+    /// `key` must not be one of the standard parameters (`by`, `for`, `host`,
+    /// `proto`); use the dedicated methods for those. Otherwise the parameter
+    /// would be emitted twice, which RFC 7239 forbids.
+    pub fn with_extension(mut self, key: ForwardedKey, value: FieldValue) -> Self {
+        debug_assert!(
+            ![
+                ForwardedKey::BY,
+                ForwardedKey::FOR,
+                ForwardedKey::HOST,
+                ForwardedKey::PROTO
+            ]
+            .contains(&key),
+            "{key:?} is a standard Forwarded parameter, not an extension"
+        );
+        self.extensions.insert(key, value);
+        self
+    }
+
     /// Set the `X-Forwarded-*` headers on a request.
     ///
     /// This is equivalent to [`Forwarded::append_x_forwarded_headers`] with
@@ -401,19 +472,19 @@ impl Forwarded {
             .r#for
             .as_ref()
             .and_then(Forwardee::x_forwarded)
-            .map(|r#for| r#for.header_value());
+            .map(|r#for| r#for.to_header_value());
         append_x_forwarded_list(mode, X_FORWARDED_FOR, r#for, headers);
 
         let host = self
             .host
             .as_ref()
-            .map(|host| host.x_forwarded().as_header_value());
+            .map(|host| host.x_forwarded().to_header_value());
         append_x_forwarded_single(mode, X_FORWARDED_HOST, host, headers);
 
         let proto = self
             .proto
             .as_ref()
-            .map(|proto| proto.x_forwarded().as_header_value());
+            .map(|proto| proto.x_forwarded().to_header_value());
         append_x_forwarded_single(mode, X_FORWARDED_PROTO, proto, headers);
     }
 
@@ -440,7 +511,7 @@ impl Forwarded {
 
         if let Some(proto) = &self.proto {
             bytes.put(&b"proto="[..]);
-            put_field_value(&mut bytes, &proto.as_bytes());
+            put_field_value(&mut bytes, &proto.to_bytes());
             bytes.put_u8(b';');
         }
 
@@ -476,11 +547,7 @@ impl Forwarded {
     /// Set the `Forwarded` header on a request and the `X-Forwarded-*` headers.
     pub fn set_all_headers<B>(&self, request: &mut http::Request<B>) {
         self.set_x_forwarded_headers(request);
-        if self.any() {
-            request
-                .headers_mut()
-                .append("forwarded", self.to_header_value());
-        }
+        self.set_header(request);
     }
 }
 
@@ -733,7 +800,7 @@ impl Forwarded {
             .finish()
             .no_tail()
             .map_err(|error| ParseForwardedError {
-                kind: ParseForwadingErrorKind::MalformedRecord(nom::error::Error::new(
+                kind: ParseForwardedErrorKind::MalformedRecord(nom::error::Error::new(
                     Bytes::copy_from_slice(error.input),
                     error.code,
                 )),
@@ -759,7 +826,7 @@ impl Forwarded {
         {
             if data.contains_key(&key) {
                 return Err(ParseForwardedError {
-                    kind: ParseForwadingErrorKind::DuplicateField(key),
+                    kind: ParseForwardedErrorKind::DuplicateField(key),
                 });
             }
 
@@ -785,14 +852,11 @@ impl Forwarded {
             .map(|value| {
                 let value = value.unescaped();
                 let v = std::str::from_utf8(&value).map_err(|error| ParseForwardedError {
-                    kind: ParseForwadingErrorKind::NonUtf8Proto { error },
+                    kind: ParseForwardedErrorKind::NonUtf8Proto { error },
                 })?;
 
                 ForwardedProtocol::from_str(v).map_err(|error| ParseForwardedError {
-                    kind: ParseForwadingErrorKind::InvalidScheme {
-                        key: "proto".to_string(),
-                        error,
-                    },
+                    kind: ParseForwardedErrorKind::InvalidScheme { error },
                 })
             })
             .transpose()?;
@@ -806,15 +870,12 @@ impl Forwarded {
         })
     }
 
-    fn parse_record(value: &[u8]) -> Result<Forwarded, ParseForwardedError>
-    where
-        Self: Sized,
-    {
+    fn parse_record(value: &[u8]) -> Result<Forwarded, ParseForwardedError> {
         let records = parse::forwarded_record(value)
             .finish()
             .no_tail()
             .map_err(|error| ParseForwardedError {
-                kind: ParseForwadingErrorKind::MalformedRecord(nom::error::Error::new(
+                kind: ParseForwardedErrorKind::MalformedRecord(nom::error::Error::new(
                     Bytes::copy_from_slice(error.input),
                     error.code,
                 )),
@@ -839,7 +900,7 @@ impl FromStr for Forwarded {
 }
 
 #[derive(Debug, Error)]
-enum ParseForwadingErrorKind {
+enum ParseForwardedErrorKind {
     #[error("invalid key=value pair in FORWARDED: {0:?}")]
     MalformedRecord(nom::error::Error<Bytes>),
 
@@ -858,19 +919,19 @@ enum ParseForwadingErrorKind {
     #[error("invalid host for FORWARDED (host): userinfo is not permitted")]
     HostWithUserinfo,
 
-    #[error("invalid host for FORWARDED (host): {error}")]
+    #[error("invalid host for FORWARDED (host): not valid UTF-8: {error}")]
     NonUtf8Host {
         #[source]
         error: std::str::Utf8Error,
     },
 
-    #[error("invalid protocol for FORWARDED ({key}): {error}")]
+    #[error("invalid protocol for FORWARDED (proto): {error}")]
     InvalidScheme {
-        key: String,
+        #[source]
         error: http::uri::InvalidUri,
     },
 
-    #[error("invalid protocol for FORWARDED (proto): {error}")]
+    #[error("invalid protocol for FORWARDED (proto): not valid UTF-8: {error}")]
     NonUtf8Proto {
         #[source]
         error: std::str::Utf8Error,
@@ -879,20 +940,9 @@ enum ParseForwadingErrorKind {
 
 /// An error parsing a `Forwarded` header record.
 #[derive(Debug, Error)]
-#[error("{}", .kind)]
+#[error(transparent)]
 pub struct ParseForwardedError {
-    kind: ParseForwadingErrorKind,
-}
-
-impl<T> From<T> for ParseForwardedError
-where
-    ParseForwadingErrorKind: From<T>,
-{
-    fn from(source: T) -> Self {
-        ParseForwardedError {
-            kind: source.into(),
-        }
-    }
+    kind: ParseForwardedErrorKind,
 }
 
 /// A node in a `Forwarded` header: the value of a `for` or `by` parameter.
@@ -914,6 +964,149 @@ pub struct Forwardee {
     port: Option<NodePort>,
 }
 
+/// An obfuscated identifier, used in a [`Forwardee`] to identify a node or port
+/// without revealing it (`obfnode` and `obfport` in RFC 7239 section 6.3):
+///
+/// ```text
+/// obfnode = "_" 1*( ALPHA / DIGIT / "." / "_" / "-")
+/// obfport = "_" 1*(ALPHA / DIGIT / "." / "_" / "-")
+/// ```
+///
+/// The name is stored without the leading `_`, and is validated on construction,
+/// so it is always valid in a `Forwarded` header. [`Display`](fmt::Display) and
+/// [`FromStr`] use the header form, including the leading `_`.
+///
+/// ```
+/// use hyproxy::headers::forward::ObfuscatedName;
+///
+/// const PROXY: ObfuscatedName = ObfuscatedName::from_static("proxy-1");
+/// assert_eq!(PROXY.as_str(), "proxy-1");
+/// assert_eq!(PROXY.to_string(), "_proxy-1");
+/// assert_eq!("_proxy-1".parse::<ObfuscatedName>().unwrap(), PROXY);
+///
+/// assert!(ObfuscatedName::new("not valid!").is_err());
+/// ```
+///
+/// Invalid names in a `const` are rejected at compile time:
+///
+/// ```compile_fail
+/// use hyproxy::headers::forward::ObfuscatedName;
+///
+/// const INVALID: ObfuscatedName = ObfuscatedName::from_static("not valid!");
+/// ```
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ObfuscatedName(Bytes);
+
+impl ObfuscatedName {
+    /// Create an obfuscated name, without the leading `_`.
+    ///
+    /// Returns an error if `name` is empty, or contains characters other than
+    /// `ALPHA / DIGIT / "." / "_" / "-"`.
+    pub fn new(name: &str) -> Result<Self, ForwardParseError> {
+        if Self::is_valid(name.as_bytes()) {
+            Ok(Self(Bytes::copy_from_slice(name.as_bytes())))
+        } else {
+            Err(ForwardParseError {
+                kind: ErrorKind::InvalidObfuscatedIdentifier,
+            })
+        }
+    }
+
+    /// Create an obfuscated name from a static string, without the leading `_`.
+    ///
+    /// # Panics
+    /// If `name` is not a valid obfuscated name (see [`ObfuscatedName::new`]).
+    /// When used in a `const` context, this is a compile-time error instead.
+    pub const fn from_static(name: &'static str) -> Self {
+        assert!(
+            Self::is_valid(name.as_bytes()),
+            "invalid obfuscated name: expected 1 or more of ALPHA / DIGIT / '.' / '_' / '-'"
+        );
+        Self(Bytes::from_static(name.as_bytes()))
+    }
+
+    /// The name, without the leading `_`.
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("obfuscated names are validated as ASCII")
+    }
+
+    const fn is_valid(name: &[u8]) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+
+        let mut i = 0;
+        while i < name.len() {
+            if !is_obfuscated_char(name[i]) {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+impl fmt::Debug for ObfuscatedName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ObfuscatedName")
+            .field(&self.as_str())
+            .finish()
+    }
+}
+
+impl fmt::Display for ObfuscatedName {
+    /// Formats the name as it appears in a header, with the leading `_`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "_{}", self.as_str())
+    }
+}
+
+impl FromStr for ObfuscatedName {
+    type Err = ForwardParseError;
+
+    /// Parse an obfuscated name in its header form, with the leading `_`.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .strip_prefix('_')
+            .ok_or(ForwardParseError {
+                kind: ErrorKind::InvalidObfuscatedIdentifier,
+            })
+            .and_then(Self::new)
+    }
+}
+
+impl AsRef<str> for ObfuscatedName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl TryFrom<&str> for ObfuscatedName {
+    type Error = ForwardParseError;
+
+    /// Equivalent to [`ObfuscatedName::new`]: `name` is without the leading `_`.
+    fn try_from(name: &str) -> Result<Self, Self::Error> {
+        Self::new(name)
+    }
+}
+
+impl TryFrom<Token> for ObfuscatedName {
+    type Error = ForwardParseError;
+
+    /// Validate a token as an obfuscated name (without the leading `_`).
+    ///
+    /// Tokens permit characters (such as `!` or `~`) which obfuscated names do not.
+    fn try_from(token: Token) -> Result<Self, Self::Error> {
+        if Self::is_valid(token.as_bytes()) {
+            Ok(Self(token.into_bytes()))
+        } else {
+            Err(ForwardParseError {
+                kind: ErrorKind::InvalidObfuscatedIdentifier,
+            })
+        }
+    }
+}
+
 /// The name portion of a [`Forwardee`] (`nodename` in RFC 7239 section 6).
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum NodeName {
@@ -922,10 +1115,7 @@ pub enum NodeName {
 
     /// An obfuscated identifier (`obfnode`), used to identify an interface
     /// without revealing its address.
-    ///
-    /// The token is stored without the leading `_`. RFC 7239 restricts it to
-    /// `ALPHA / DIGIT / "." / "_" / "-"`, which is narrower than [`Token`].
-    Obfuscated(Token),
+    Obfuscated(ObfuscatedName),
 
     /// The `unknown` identifier, used when the node is not known or is
     /// intentionally hidden.
@@ -939,10 +1129,7 @@ pub enum NodePort {
     Port(u16),
 
     /// An obfuscated port (`obfport`).
-    ///
-    /// The token is stored without the leading `_`. RFC 7239 restricts it to
-    /// `ALPHA / DIGIT / "." / "_" / "-"`, which is narrower than [`Token`].
-    Obfuscated(Token),
+    Obfuscated(ObfuscatedName),
 }
 
 impl Forwardee {
@@ -960,10 +1147,7 @@ impl Forwardee {
     }
 
     /// A node identified by an obfuscated name, with no port.
-    ///
-    /// The name is emitted with a leading `_`, and should only contain
-    /// `ALPHA / DIGIT / "." / "_" / "-"` to be a valid RFC 7239 `obfnode`.
-    pub const fn obfuscated(name: Token) -> Self {
+    pub const fn obfuscated(name: ObfuscatedName) -> Self {
         Self::new(NodeName::Obfuscated(name), None)
     }
 
@@ -1098,7 +1282,7 @@ impl TryFrom<FieldValue> for Forwardee {
             .ok()
             .and_then(|node| Forwardee::parse_node(node).ok())
             .ok_or_else(|| ParseForwardedError {
-                kind: ParseForwadingErrorKind::InvalidForwardee(Bytes::copy_from_slice(&node)),
+                kind: ParseForwardedErrorKind::InvalidForwardee(Bytes::copy_from_slice(&node)),
             })
     }
 }
@@ -1132,22 +1316,13 @@ const fn is_obfuscated_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-'
 }
 
-/// Parse an `obfnode` or `obfport`, returning the identifier without the leading `_`.
-fn parse_obfuscated(value: &str) -> Option<Token> {
-    let name = value.strip_prefix('_')?;
-    (!name.is_empty() && name.bytes().all(is_obfuscated_char))
-        .then(|| Token::new(Bytes::copy_from_slice(name.as_bytes())))
-}
-
 impl fmt::Display for NodeName {
     /// Formats the name as it appears in a `node`, without any quoting.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NodeName::Address(IpAddr::V4(ip)) => write!(f, "{ip}"),
             NodeName::Address(IpAddr::V6(ip)) => write!(f, "[{ip}]"),
-            NodeName::Obfuscated(name) => {
-                write!(f, "_{}", String::from_utf8_lossy(name.as_bytes()))
-            }
+            NodeName::Obfuscated(name) => write!(f, "{name}"),
             NodeName::Unknown => f.write_str("unknown"),
         }
     }
@@ -1166,9 +1341,7 @@ impl FromStr for NodeName {
         }
 
         if name.starts_with('_') {
-            return parse_obfuscated(name)
-                .map(NodeName::Obfuscated)
-                .ok_or(invalid(ErrorKind::InvalidObfuscatedIdentifier));
+            return name.parse().map(NodeName::Obfuscated);
         }
 
         if let Some(ip) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
@@ -1197,9 +1370,7 @@ impl fmt::Display for NodePort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NodePort::Port(port) => write!(f, "{port}"),
-            NodePort::Obfuscated(port) => {
-                write!(f, "_{}", String::from_utf8_lossy(port.as_bytes()))
-            }
+            NodePort::Obfuscated(port) => write!(f, "{port}"),
         }
     }
 }
@@ -1212,9 +1383,7 @@ impl FromStr for NodePort {
         let invalid = |kind| ForwardParseError { kind };
 
         if port.starts_with('_') {
-            return parse_obfuscated(port)
-                .map(NodePort::Obfuscated)
-                .ok_or(invalid(ErrorKind::InvalidObfuscatedIdentifier));
+            return port.parse().map(NodePort::Obfuscated);
         }
 
         // Checked explicitly because `u16::from_str` also accepts a leading `+`.
@@ -1240,7 +1409,7 @@ pub struct XForwardee(XForwardAddress);
 
 impl XForwardee {
     /// The `X-Forwarded-For` header value for the `XForwardee`.
-    pub fn header_value(&self) -> http::HeaderValue {
+    pub fn to_header_value(&self) -> http::HeaderValue {
         self.0.to_string().parse().unwrap()
     }
 }
@@ -1248,13 +1417,14 @@ impl XForwardee {
 /// The original protocol used in a proxied request,
 /// reported in the `Forwarded` header.
 ///
-/// Only `http` and `https` are supported by [RFC-2739](https://datatracker.ietf.org/doc/html/rfc7239)
+/// [RFC 7239 section 5.4](https://datatracker.ietf.org/doc/html/rfc7239#section-5.4) permits any
+/// URI scheme name, though `http` and `https` are by far the most common.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct ForwardedProtocol(http::uri::Scheme);
 
 impl ForwardedProtocol {
     /// Convert the `ForwardProtocol` to a byte string.
-    pub fn as_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> Bytes {
         Bytes::copy_from_slice(self.0.as_str().as_bytes())
     }
 
@@ -1271,8 +1441,8 @@ pub struct XForwardedProtocol<'a>(&'a ForwardedProtocol);
 
 impl XForwardedProtocol<'_> {
     /// Convert the `ForwardProtocol` to a `http::HeaderValue`.
-    pub fn as_header_value(&self) -> http::HeaderValue {
-        http::HeaderValue::from_bytes(self.0.as_bytes().as_ref()).unwrap()
+    pub fn to_header_value(&self) -> http::HeaderValue {
+        http::HeaderValue::from_bytes(self.0.to_bytes().as_ref()).unwrap()
     }
 }
 
@@ -1354,7 +1524,7 @@ impl ForwardAddress {
     }
 
     /// Convert the `ForwardAddress` to a `http::HeaderValue`.
-    pub fn as_header_value(&self) -> http::HeaderValue {
+    pub fn to_header_value(&self) -> http::HeaderValue {
         http::HeaderValue::from_bytes(self.to_bytes().as_ref()).unwrap()
     }
 }
@@ -1383,7 +1553,7 @@ impl From<IpAddr> for ForwardAddress {
 
 /// An error parsing a [`Forwardee`], [`ForwardAddress`], [`NodeName`] or [`NodePort`].
 #[derive(Debug, Error)]
-#[error("{}", .kind)]
+#[error(transparent)]
 pub struct ForwardParseError {
     kind: ErrorKind,
 }
@@ -1500,7 +1670,7 @@ impl ForwardedHost {
     /// Parse a `ForwardedHost` from a byte string.
     pub fn parse_bytes(value: &[u8]) -> Result<Self, ParseForwardedError> {
         let value = std::str::from_utf8(value).map_err(|error| ParseForwardedError {
-            kind: ParseForwadingErrorKind::NonUtf8Host { error },
+            kind: ParseForwardedErrorKind::NonUtf8Host { error },
         })?;
         Self::from_str(value)
     }
@@ -1515,12 +1685,12 @@ impl FromStr for ForwardedHost {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.contains('@') {
             return Err(ParseForwardedError {
-                kind: ParseForwadingErrorKind::HostWithUserinfo,
+                kind: ParseForwardedErrorKind::HostWithUserinfo,
             });
         }
 
         let authority = http::uri::Authority::from_str(s).map_err(|error| ParseForwardedError {
-            kind: ParseForwadingErrorKind::InvalidHost { error },
+            kind: ParseForwardedErrorKind::InvalidHost { error },
         })?;
         Ok(ForwardedHost {
             host: authority.host().to_string(),
@@ -1535,7 +1705,7 @@ pub struct XForwardedHost<'a>(&'a ForwardedHost);
 
 impl XForwardedHost<'_> {
     /// The `X-Forwarded-Host` header value for the `XForwardedHost`.
-    pub fn as_header_value(&self) -> http::HeaderValue {
+    pub fn to_header_value(&self) -> http::HeaderValue {
         http::HeaderValue::from_bytes(self.0.to_bytes().as_ref()).unwrap()
     }
 }
@@ -1575,10 +1745,7 @@ pub enum ForwardeeMode {
     Address,
 
     /// The interface should be displayed as an obfuscated identifier.
-    ///
-    /// The name is emitted with a leading `_`, and should only contain
-    /// `ALPHA / DIGIT / "." / "_" / "-"` to be a valid RFC 7239 `obfnode`.
-    Obfuscated(Token),
+    Obfuscated(ObfuscatedName),
 
     /// The interface should be displayed as an unknown interface.
     Unknown,
@@ -1667,7 +1834,11 @@ pub struct SetForwardedHeader<S> {
 }
 
 impl<S> SetForwardedHeader<S> {
-    /// Create a new `ForwardedHeader` middleware.
+    /// Create a new `SetForwardedHeader` middleware.
+    ///
+    /// See [`SetForwardedHeaderLayer::set_x_headers`] and
+    /// [`SetForwardedHeaderLayer::append_forwarded_headers`] for the meaning of
+    /// `set_x_headers` and `append`.
     pub fn new(
         inner: S,
         config: ForwardedHeaderConfig,
@@ -1686,6 +1857,32 @@ impl<S> SetForwardedHeader<S> {
     pub fn config(mut self, config: ForwardedHeaderConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Set whether to include the `X-Forwarded-*` headers.
+    ///
+    /// See [`SetForwardedHeaderLayer::set_x_headers`].
+    pub fn set_x_headers(mut self, set_x_headers: bool) -> Self {
+        self.set_x_headers = set_x_headers;
+        self
+    }
+
+    /// Set how the new `Forwarded` record is combined with existing ones.
+    ///
+    /// See [`SetForwardedHeaderLayer::append_forwarded_headers`].
+    pub fn append_forwarded_headers(mut self, append: AppendHeaderRecordMode) -> Self {
+        self.append = append;
+        self
+    }
+
+    /// Returns a reference to the inner service.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Returns the inner service, consuming this middleware.
+    pub fn into_inner(self) -> S {
+        self.inner
     }
 
     /// Apply the `Forwarded` header configuration to a request.
@@ -1721,33 +1918,19 @@ where
     }
 }
 
-/// A middleware for adding a `Forwarded` header to requests.
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+/// A layer which wraps services in [`SetForwardedHeader`], adding a `Forwarded`
+/// header to requests.
+#[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
 pub struct SetForwardedHeaderLayer {
     config: ForwardedHeaderConfig,
     set_x_headers: bool,
     append: AppendHeaderRecordMode,
 }
 
-impl Default for SetForwardedHeaderLayer {
-    /// Create a new `ForwardedHeaderLayer` middleware.
-    fn default() -> Self {
-        Self {
-            config: ForwardedHeaderConfig::default(),
-            set_x_headers: false,
-            append: AppendHeaderRecordMode::default(),
-        }
-    }
-}
-
 impl SetForwardedHeaderLayer {
-    /// Create a new `ForwardedHeaderLayer` middleware.
+    /// Create a new `SetForwardedHeaderLayer` with the default configuration.
     pub fn new() -> Self {
-        Self {
-            config: ForwardedHeaderConfig::default(),
-            set_x_headers: false,
-            append: AppendHeaderRecordMode::default(),
-        }
+        Self::default()
     }
 
     /// Set the configuration for the `Forwarded` header.
@@ -1783,12 +1966,12 @@ impl<S> tower::layer::Layer<S> for SetForwardedHeaderLayer {
     type Service = SetForwardedHeader<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        SetForwardedHeader {
+        SetForwardedHeader::new(
             inner,
-            config: self.config.clone(),
-            set_x_headers: self.set_x_headers,
-            append: self.append.clone(),
-        }
+            self.config.clone(),
+            self.set_x_headers,
+            self.append.clone(),
+        )
     }
 }
 
@@ -1825,7 +2008,7 @@ mod tests {
         );
         assert_eq!(Forwardee::unknown().to_bytes().as_ref(), b"unknown");
         assert_eq!(
-            Forwardee::obfuscated(Token::from_static("name"))
+            Forwardee::obfuscated(ObfuscatedName::from_static("name"))
                 .to_bytes()
                 .as_ref(),
             b"_name"
@@ -2022,8 +2205,8 @@ mod tests {
         assert_eq!(forwarded.proto, None);
 
         let config = ForwardedHeaderConfig {
-            by: ForwardeeMode::Obfuscated(Token::from_static("proxy")),
-            r#for: ForwardeeMode::Obfuscated(Token::from_static("client")),
+            by: ForwardeeMode::Obfuscated(ObfuscatedName::from_static("proxy")),
+            r#for: ForwardeeMode::Obfuscated(ObfuscatedName::from_static("client")),
             host: true,
             proto: true,
         };
@@ -2035,11 +2218,13 @@ mod tests {
 
         assert_eq!(
             forwarded.by.as_ref(),
-            Some(&Forwardee::obfuscated(Token::from_static("proxy")))
+            Some(&Forwardee::obfuscated(ObfuscatedName::from_static("proxy")))
         );
         assert_eq!(
             forwarded.r#for.as_ref(),
-            Some(&Forwardee::obfuscated(Token::from_static("client")))
+            Some(&Forwardee::obfuscated(ObfuscatedName::from_static(
+                "client"
+            )))
         );
         assert_eq!(forwarded.host, None);
         assert_eq!(forwarded.proto, None);
@@ -2164,7 +2349,7 @@ mod tests {
             Default::default(),
         )
         .config(ForwardedHeaderConfig {
-            r#for: ForwardeeMode::Obfuscated(Token::from_static("example-proxy")),
+            r#for: ForwardeeMode::Obfuscated(ObfuscatedName::from_static("example-proxy")),
             ..Default::default()
         });
 
@@ -2197,7 +2382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarded_header_service_preseves_junk() {
+    async fn forwarded_header_service_preserves_junk() {
         let service = SetForwardedHeader::new(
             tower::service_fn(|req: http::Request<()>| async { Ok::<_, ()>(req) }),
             Default::default(),
@@ -2481,7 +2666,7 @@ mod tests {
             let forwarded: Forwarded = input.parse().unwrap();
             assert_eq!(
                 forwarded.r#for,
-                Some(Forwardee::obfuscated(Token::from_static("gazonk"))),
+                Some(Forwardee::obfuscated(ObfuscatedName::from_static("gazonk"))),
                 "{input}"
             );
         }
@@ -2549,8 +2734,8 @@ mod tests {
         }
     }
 
-    fn token(name: &'static str) -> Token {
-        Token::from_static(name)
+    fn obf_name(name: &'static str) -> ObfuscatedName {
+        ObfuscatedName::from_static(name)
     }
 
     #[test]
@@ -2565,24 +2750,24 @@ mod tests {
             ),
             (
                 "UNKNOWN:_p",
-                Forwardee::new(NodeName::Unknown, Some(NodePort::Obfuscated(token("p")))),
+                Forwardee::new(NodeName::Unknown, Some(NodePort::Obfuscated(obf_name("p")))),
             ),
             (
                 "_hidden:80",
-                Forwardee::obfuscated(token("hidden")).with_port(NodePort::Port(80)),
+                Forwardee::obfuscated(obf_name("hidden")).with_port(NodePort::Port(80)),
             ),
             (
                 "_hidden:_port",
-                Forwardee::obfuscated(token("hidden"))
-                    .with_port(NodePort::Obfuscated(token("port"))),
+                Forwardee::obfuscated(obf_name("hidden"))
+                    .with_port(NodePort::Obfuscated(obf_name("port"))),
             ),
             (
                 "192.0.2.1:_p0rt",
-                Forwardee::from(v4).with_port(NodePort::Obfuscated(token("p0rt"))),
+                Forwardee::from(v4).with_port(NodePort::Obfuscated(obf_name("p0rt"))),
             ),
             (
                 "[2001:db8:cafe::17]:_p0rt",
-                Forwardee::from(v6).with_port(NodePort::Obfuscated(token("p0rt"))),
+                Forwardee::from(v6).with_port(NodePort::Obfuscated(obf_name("p0rt"))),
             ),
             ("[2001:db8:cafe::17]", Forwardee::from(v6)),
         ];
@@ -2625,15 +2810,15 @@ mod tests {
                 Forwardee::unknown().with_port(NodePort::Port(8080)),
                 "\"unknown:8080\"",
             ),
-            (Forwardee::obfuscated(token("hidden")), "_hidden"),
+            (Forwardee::obfuscated(obf_name("hidden")), "_hidden"),
             (
-                Forwardee::obfuscated(token("hidden"))
-                    .with_port(NodePort::Obfuscated(token("port"))),
+                Forwardee::obfuscated(obf_name("hidden"))
+                    .with_port(NodePort::Obfuscated(obf_name("port"))),
                 "\"_hidden:_port\"",
             ),
             (
                 Forwardee::from(IpAddr::V6(Ipv6Addr::LOCALHOST))
-                    .with_port(NodePort::Obfuscated(token("p"))),
+                    .with_port(NodePort::Obfuscated(obf_name("p"))),
                 "\"[::1]:_p\"",
             ),
             (
@@ -2665,7 +2850,7 @@ mod tests {
         assert_eq!(forwardee.clone().without_port().port(), None);
 
         assert_eq!(Forwardee::unknown().ip(), None);
-        assert_eq!(Forwardee::obfuscated(token("x")).ip(), None);
+        assert_eq!(Forwardee::obfuscated(obf_name("x")).ip(), None);
     }
 
     #[test]
@@ -2684,11 +2869,12 @@ mod tests {
 
         let r#for = forwarded.r#for.as_ref().unwrap();
         assert_eq!(r#for.ip(), Some("2001:db8:cafe::17".parse().unwrap()));
-        assert_eq!(r#for.port(), Some(&NodePort::Obfuscated(token("p0rt"))));
+        assert_eq!(r#for.port(), Some(&NodePort::Obfuscated(obf_name("p0rt"))));
         assert_eq!(
             forwarded.by,
             Some(
-                Forwardee::obfuscated(token("proxy")).with_port(NodePort::Obfuscated(token("in")))
+                Forwardee::obfuscated(obf_name("proxy"))
+                    .with_port(NodePort::Obfuscated(obf_name("in")))
             )
         );
         assert_eq!(roundtrip(&forwarded), forwarded);
@@ -2699,7 +2885,7 @@ mod tests {
         let forwarded = Forwarded {
             r#for: Some(
                 Forwardee::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
-                    .with_port(NodePort::Obfuscated(token("p"))),
+                    .with_port(NodePort::Obfuscated(obf_name("p"))),
             ),
             ..Default::default()
         };
@@ -3052,6 +3238,122 @@ mod tests {
                 assert_eq!(values(&headers, name), values(&upstream, name), "{mode:?}");
             }
         }
+    }
+
+    #[test]
+    fn forwarded_builder() {
+        let ext = ForwardedKey::new(Token::from_static("ext"));
+        let value = crate::headers::fields::parse_field(b"\"a b\"").unwrap();
+
+        let forwarded = Forwarded::default()
+            .with_for(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 80))
+            .with_by(Forwardee::obfuscated(obf_name("proxy")))
+            .with_host("example.com".parse().unwrap())
+            .with_proto(http::uri::Scheme::HTTPS)
+            .with_extension(ext.clone(), value.clone());
+
+        assert_eq!(
+            forwarded,
+            Forwarded {
+                by: Some(Forwardee::obfuscated(obf_name("proxy"))),
+                r#for: Some(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 80).into()),
+                host: Some("example.com".parse().unwrap()),
+                proto: Some(http::uri::Scheme::HTTPS.into()),
+                extensions: [(ext, value)].into_iter().collect(),
+            }
+        );
+        assert_eq!(roundtrip(&forwarded), forwarded);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "standard Forwarded parameter")]
+    fn forwarded_builder_rejects_standard_extension_key() {
+        let value = crate::headers::fields::parse_field(b"unknown").unwrap();
+        let _ = Forwarded::default()
+            .with_extension(ForwardedKey::new(Token::from_static("FOR")), value);
+    }
+
+    #[test]
+    fn set_all_headers_sets_forwarded_and_x_headers() {
+        let forwarded = Forwarded::default()
+            .with_for(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+            .with_proto(http::uri::Scheme::HTTPS);
+
+        let mut request = http::Request::new(());
+        forwarded.set_all_headers(&mut request);
+        assert_eq!(
+            request.headers().get(FORWARDED).unwrap(),
+            "for=192.0.2.1;proto=https"
+        );
+        assert_eq!(request.headers().get(X_FORWARDED_FOR).unwrap(), "192.0.2.1");
+        assert_eq!(request.headers().get(X_FORWARDED_PROTO).unwrap(), "https");
+
+        let mut request = http::Request::new(());
+        Forwarded::default().set_all_headers(&mut request);
+        assert!(request.headers().is_empty());
+    }
+
+    #[test]
+    fn parse_errors_expose_source() {
+        use std::error::Error as _;
+
+        let error = "proto=\"\\ \"".parse::<Forwarded>().unwrap_err();
+        assert!(error.to_string().contains("invalid protocol"), "{error}");
+        assert!(
+            error.source().is_some(),
+            "InvalidScheme should expose the underlying InvalidUri"
+        );
+
+        let error = "host=\"\\ \"".parse::<Forwarded>().unwrap_err();
+        assert!(error.to_string().contains("invalid host"), "{error}");
+        assert!(error.source().is_some());
+
+        let error = "[::1]:x".parse::<ForwardAddress>().unwrap_err();
+        assert!(error.to_string().contains("port"), "{error}");
+    }
+
+    #[test]
+    fn obfuscated_name_validation() {
+        for valid in ["a", "hidden", "proxy-1", "a.b_c-d", "_leading", "0"] {
+            let name = ObfuscatedName::new(valid).unwrap();
+            assert_eq!(name.as_str(), valid);
+            assert_eq!(name.to_string(), format!("_{valid}"));
+            assert_eq!(name.to_string().parse::<ObfuscatedName>().unwrap(), name);
+        }
+
+        for invalid in ["", "a b", "a!b", "a~b", "a:b", "caf\u{e9}", "a\"b"] {
+            assert!(ObfuscatedName::new(invalid).is_err(), "{invalid:?}");
+        }
+
+        // The header form requires the leading `_`.
+        assert!("hidden".parse::<ObfuscatedName>().is_err());
+        assert!("_".parse::<ObfuscatedName>().is_err());
+    }
+
+    #[test]
+    fn obfuscated_name_from_token() {
+        assert_eq!(
+            ObfuscatedName::try_from(Token::from_static("proxy")).unwrap(),
+            obf_name("proxy")
+        );
+        // `!` and `~` are valid token characters, but not valid in an obfuscated name.
+        assert!(ObfuscatedName::try_from(Token::from_static("a!b")).is_err());
+        assert!(ObfuscatedName::try_from(Token::from_static("a~b")).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid obfuscated name")]
+    fn obfuscated_name_from_static_panics() {
+        let _ = ObfuscatedName::from_static("not valid!");
+    }
+
+    #[test]
+    fn obfuscated_name_debug() {
+        assert_eq!(
+            format!("{:?}", obf_name("proxy")),
+            "ObfuscatedName(\"proxy\")"
+        );
     }
 
     #[test]

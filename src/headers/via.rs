@@ -98,7 +98,7 @@ pub enum ParseViaError {
     #[error(transparent)]
     InvalidToken(#[from] InvalidValue),
 
-    /// An error occured parsing the header.
+    /// An error occurred parsing the header.
     #[error("parsing error: {0:?}")]
     ParserError(nom::error::Error<Bytes>),
 
