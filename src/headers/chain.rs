@@ -4,8 +4,15 @@
 //! This module provides a set of types for managing header chains,
 //! and their associated records.
 //!
-//! Header chains follow the spec for [RFC 7230](https://tools.ietf.org/html/rfc7230),
-//! which defines the set of permitted and non-permitted tokens.
+//! Header values are parsed according to the field value rules in
+//! [RFC 9110 section 5.6](https://datatracker.ietf.org/doc/html/rfc9110#section-5.6)
+//! (formerly RFC 7230), which define tokens, quoted strings and lists.
+//!
+//! A [`HeaderChain`] holds every line of a header, each line is a [`Header`],
+//! and each comma-separated entry within a line is a [`Record`]. Records that
+//! fail to parse are kept as raw bytes, so that a proxy can pass through
+//! values it does not understand unchanged. [`AppendHeaderRecordMode`]
+//! controls how a new record is combined with the existing chain.
 
 use std::{fmt::Debug, ops};
 
@@ -52,6 +59,10 @@ where
     T: HeaderRecordKind,
 {
     /// Create a new header chain from the headers in the given headers map.
+    ///
+    /// Header values which fail to parse are preserved as raw records, so that
+    /// they can be passed through unchanged. Use [`HeaderChain::try_from_headers`]
+    /// to reject them instead.
     pub fn from_headers(headers: &HeaderMap) -> Self {
         let entries = headers.get_all(&T::HEADER_NAME);
 
@@ -68,6 +79,37 @@ where
         }
 
         Self { inner }
+    }
+
+    /// Create a new header chain from the headers in the given headers map,
+    /// returning an error if any header value fails to parse.
+    ///
+    /// Unlike [`HeaderChain::from_headers`], every record in the resulting
+    /// chain is a parsed value, never a raw record.
+    pub fn try_from_headers(headers: &HeaderMap) -> Result<Self, T::Error> {
+        headers
+            .get_all(&T::HEADER_NAME)
+            .iter()
+            .map(Header::parse_header_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(|inner| Self { inner })
+    }
+}
+
+impl<T> HeaderChain<T> {
+    /// The first record in the chain: the first record of the first header
+    /// which has any records.
+    pub fn first_record(&self) -> Option<&Record<T>> {
+        self.inner.iter().find_map(|header| header.first())
+    }
+
+    /// The last record in the chain: the last record of the last header
+    /// which has any records.
+    ///
+    /// For headers like `Forwarded`, which proxies append to, this is the
+    /// record added by the closest proxy.
+    pub fn last_record(&self) -> Option<&Record<T>> {
+        self.inner.iter().rev().find_map(|header| header.last())
     }
 }
 
@@ -275,7 +317,6 @@ where
     pub fn append_record<R>(mode: &AppendHeaderRecordMode, record: R, headers: &mut http::HeaderMap)
     where
         R: Into<Record<T>>,
-        T: Debug,
     {
         let mut chain = Self::from_headers(headers);
         headers.remove(T::HEADER_NAME);
@@ -345,6 +386,26 @@ mod chain_tests {
         chain = chain.keep_last();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0], Header::single("application/xml"));
+    }
+
+    #[test]
+    fn first_and_last_record() {
+        let mut chain: HeaderChain<&str> = HeaderChain::new();
+        assert!(chain.first_record().is_none());
+        assert!(chain.last_record().is_none());
+
+        chain.push_header(Header::new());
+        chain.push_header(Header::single("a"));
+        chain.push_record("b");
+        chain.push_header(Header::single("c"));
+        chain.push_header(Header::new());
+
+        assert_eq!(chain.first_record(), Some(&Record::from_value("a")));
+        assert_eq!(
+            chain.last_record(),
+            Some(&Record::from_value("c")),
+            "empty trailing headers are skipped"
+        );
     }
 
     #[test]
@@ -531,7 +592,7 @@ mod header_tests {
 
 /// A record is a single value in a header chain.
 ///
-/// It is usually deliminated by a comma, but can be deliminated
+/// It is usually delimited by a comma, but can be delimited
 /// by any character.
 ///
 /// This record object holds either the parsed value `T`, or a raw
@@ -584,13 +645,13 @@ impl<T> Record<T> {
     /// Create a new record with the given raw header value.
     ///
     /// This is private because it assumes that the raw value consists
-    /// only of bytes that are valid in a header value.
+    /// only of bytes that are valid in a header value. All callers pass the
+    /// bytes of an existing `http::HeaderValue`, which guarantees this.
     fn from_raw(value: Vec<u8>) -> Self {
-        // debug_assert!(
-        //     value.iter().all(|c| is_valid(*c)),
-        //     "Raw header values must be valid header bytes"
-        // );
-        //TODO: Validate bytes?
+        debug_assert!(
+            http::HeaderValue::from_bytes(&value).is_ok(),
+            "raw header records must contain only valid header value bytes"
+        );
 
         Self(RecordEntry::Raw(value))
     }

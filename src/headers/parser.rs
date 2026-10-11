@@ -1,9 +1,9 @@
 //! Parser for header field values.
 //!
 //! Header field values are delimiter separated sequences of tokens and quoted strings,
-//! defined in [RFC 7230](https://tools.ietf.org/html/rfc7230#section-3.2.6).
+//! defined in [RFC 9110 section 5.6](https://datatracker.ietf.org/doc/html/rfc9110#section-5.6) (formerly RFC 7230).
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use nom::branch::alt;
 use nom::bytes::complete::{escaped, tag, take_while1};
 use nom::character::complete::{satisfy, space0};
@@ -102,6 +102,64 @@ mod test_quoted {
 
         let input = br#""abc\"""#;
         quoted_text(input).no_tail().unwrap();
+    }
+}
+
+/// Write `value` as an RFC 9110 field value: bare if it is a valid token,
+/// otherwise as a quoted-string with `"` and `\` escaped.
+pub(crate) fn put_field_value(buf: &mut BytesMut, value: &[u8]) {
+    if !value.is_empty() && value.iter().all(|c| is_token(*c)) {
+        buf.put(value);
+        return;
+    }
+
+    buf.put_u8(b'"');
+    for &c in value {
+        if c == b'"' || c == b'\\' {
+            buf.put_u8(b'\\');
+        }
+        buf.put_u8(c);
+    }
+    buf.put_u8(b'"');
+}
+
+#[cfg(test)]
+mod test_put_field_value {
+    use super::*;
+
+    fn encode(value: &[u8]) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        put_field_value(&mut buf, value);
+        buf.to_vec()
+    }
+
+    #[test]
+    fn token_is_bare() {
+        assert_eq!(encode(b"example.com"), b"example.com");
+        assert_eq!(encode(b"_hidden"), b"_hidden");
+    }
+
+    #[test]
+    fn non_token_is_quoted() {
+        assert_eq!(encode(b"example.com:8080"), b"\"example.com:8080\"");
+        assert_eq!(encode(b"[::1]"), b"\"[::1]\"");
+        assert_eq!(encode(b"a, b"), b"\"a, b\"");
+        assert_eq!(encode(b""), b"\"\"");
+    }
+
+    #[test]
+    fn escapes_quote_and_backslash() {
+        assert_eq!(encode(br#"a"b\c"#), br#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn quoted_output_parses_back() {
+        for value in [&b"example.com:8080"[..], b"a, b", br#"a"b\c"#] {
+            let encoded = encode(value);
+            let parsed = quoted_text(&encoded).no_tail().unwrap();
+            // Parsed quoted text keeps escapes; compare against the encoded interior.
+            assert_eq!(parsed.as_bytes(), &encoded[1..encoded.len() - 1]);
+        }
     }
 }
 

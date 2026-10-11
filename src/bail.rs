@@ -1,6 +1,11 @@
 //! # Bail out from processing, returning a response early
 //!
-//! Sometimes, instead of returning an error (see `hyperdriver::service::)
+//! Sometimes a middleware needs to stop processing a request and respond
+//! immediately, rather than returning an error (as, for example,
+//! `hyperdriver::service::PreprocessLayer` does). [`BailLayer`] and
+//! [`ServiceBailExt::bail`] run a synchronous preprocessor on each request,
+//! which either passes a (possibly modified) request on to the inner service,
+//! or returns a response directly.
 
 use std::fmt;
 
@@ -9,7 +14,7 @@ use self::future::BailFuture;
 /// Extends services to use the BailService directly from a method.
 pub trait ServiceBailExt {
     /// Provide a pre-processor which returns either `Ok(req)`
-    /// with a moditied request, or `Err(res)` with the desired
+    /// with a modified request, or `Err(res)` with the desired
     /// immediate response. This pre-processor is synchronous.
     fn bail<F>(self, preprocessor: F) -> BailService<Self, F>
     where
@@ -41,7 +46,7 @@ impl<S: fmt::Debug, F> fmt::Debug for BailService<S, F> {
 }
 
 impl<S, F> BailService<S, F> {
-    /// Helper Service for middleware that might error.
+    /// Wrap `inner`, running `preprocessor` on each request before it is called.
     pub fn new(inner: S, preprocessor: F) -> Self {
         Self {
             inner,
@@ -49,9 +54,20 @@ impl<S, F> BailService<S, F> {
         }
     }
 
-    /// Get a reference to the inner service.
-    pub fn service(&self) -> &S {
+    /// Returns a reference to the inner service.
+    pub fn inner(&self) -> &S {
         &self.inner
+    }
+
+    /// Returns the inner service, consuming this middleware.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+
+    /// Get a reference to the inner service.
+    #[deprecated(note = "renamed to `inner`, for consistency with other middleware")]
+    pub fn service(&self) -> &S {
+        self.inner()
     }
 }
 
@@ -138,8 +154,10 @@ mod future {
 
     pin_project_lite::pin_project! {
 
-        /// Future for when a service either errors before yielding,
-        /// or continues. This is us
+        /// Future returned by [`BailService`](super::BailService).
+        ///
+        /// Either resolves to the response returned by the preprocessor, or drives the
+        /// inner service's future.
         #[derive(Debug)]
         pub struct BailFuture<F, R, E> {
             #[pin]
@@ -149,7 +167,7 @@ mod future {
     }
 
     impl<F, R, E> BailFuture<F, R, E> {
-        /// Create a future that resolves to the contained service
+        /// Create a future that drives the inner service's future.
         pub fn future(inner: F) -> Self {
             Self {
                 state: BailFutureState::Inner { future: inner },
@@ -157,7 +175,8 @@ mod future {
             }
         }
 
-        /// Create a future that immediately resolves to an error.
+        /// Create a future that immediately resolves to `Ok(response)`, without calling the
+        /// inner service.
         pub fn bail(response: R) -> Self {
             Self {
                 state: BailFutureState::Bail {
@@ -265,7 +284,8 @@ mod tests {
         let preprocessor = |req: TestRequest| Ok::<_, Infallible>(req);
 
         let bail_service = BailService::new(inner_service, preprocessor);
-        assert!(std::matches!(bail_service.service(), MockService { .. }));
+        assert!(std::matches!(bail_service.inner(), MockService { .. }));
+        assert!(std::matches!(bail_service.into_inner(), MockService { .. }));
     }
 
     #[tokio::test]

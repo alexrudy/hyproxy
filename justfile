@@ -2,7 +2,8 @@
 
 
 nightly := "nightly-2025-06-20"
-msrv := "1.85"
+# Read from Cargo.toml, as in CI, so there is a single source of truth.
+msrv := `awk -F'"' '/^rust-version/{print $2}' Cargo.toml`
 rust := env("RUSTUP_TOOLCHAIN", "stable")
 
 # Run all checks

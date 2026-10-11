@@ -1,10 +1,11 @@
 //! HTTP header field values.
 //!
 //! Header field values are delimiter separated sequences of tokens and quoted strings,
-//! defined in [RFC 7230](https://tools.ietf.org/html/rfc7230#section-3.2.6).
+//! defined in [RFC 9110 section 5.6](https://datatracker.ietf.org/doc/html/rfc9110#section-5.6) (formerly RFC 7230).
 use core::fmt;
+use std::borrow::Cow;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
 use super::parser::{quoted_text, record, records, token, NoTail as _};
@@ -43,12 +44,12 @@ where
     I: IntoIterator<Item = &'a FieldValue>,
 {
     iter.into_iter()
-        .map(|v| v.as_bytes().to_vec())
+        .map(|v| v.to_header_bytes().to_vec())
         .collect::<Vec<_>>()
         .join([delimiter, b' '].as_slice())
 }
 
-/// A single field value component as defined by RFC-7230.
+/// A single field value component as defined by RFC 9110 section 5.6.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FieldValue(Entry);
 
@@ -58,6 +59,34 @@ impl FieldValue {
         match &self.0 {
             Entry::Token(token) => token.as_bytes(),
             Entry::QuotedText(quoted) => quoted.as_bytes(),
+        }
+    }
+
+    /// Get the semantic content of the field value.
+    ///
+    /// For tokens this is the token itself; for quoted strings this is the
+    /// text between the quotes with escape sequences decoded.
+    pub fn unescaped(&self) -> Cow<'_, [u8]> {
+        match &self.0 {
+            Entry::Token(token) => Cow::Borrowed(token.as_bytes()),
+            Entry::QuotedText(quoted) => quoted.unescaped(),
+        }
+    }
+
+    /// Get the field value in its serialized header form.
+    ///
+    /// Unlike [`FieldValue::as_bytes`], quoted strings retain their surrounding
+    /// double quotes, so the result can be written back into a header verbatim.
+    pub fn to_header_bytes(&self) -> Bytes {
+        match &self.0 {
+            Entry::Token(token) => token.0.clone(),
+            Entry::QuotedText(quoted) => {
+                let mut bytes = BytesMut::with_capacity(quoted.0.len() + 2);
+                bytes.put_u8(b'"');
+                bytes.put(quoted.as_bytes());
+                bytes.put_u8(b'"');
+                bytes.freeze()
+            }
         }
     }
 
@@ -110,7 +139,7 @@ impl From<Entry> for FieldValue {
     }
 }
 
-/// A single field value component as defined by RFC-7230.
+/// A single field value component as defined by RFC 9110 section 5.6.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Entry {
     /// Token form
@@ -230,7 +259,7 @@ impl Token {
     /// Create a token from a static string without checking for invalid characters.
     ///
     /// # Safety
-    /// The string must contain only valid token characters, as defined in RFC-7230.
+    /// The string must contain only valid token characters, as defined in RFC 9110 section 5.6.2.
     /// This is NOT all ASCII characters, as some are reserved for delimiters, and does
     /// not support unicode characters.
     pub const fn from_static_unchecked(s: &'static str) -> Self {
@@ -269,8 +298,32 @@ impl QuotedText {
     }
 
     /// Get the quoted text as a byte slice.
+    ///
+    /// This is the text between the surrounding quotes, with any
+    /// `quoted-pair` escape sequences left intact. See [`QuotedText::unescaped`].
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Get the quoted text with `quoted-pair` escape sequences (`\x`) decoded.
+    pub fn unescaped(&self) -> Cow<'_, [u8]> {
+        if !self.0.contains(&b'\\') {
+            return Cow::Borrowed(&self.0);
+        }
+
+        let mut out = Vec::with_capacity(self.0.len());
+        let mut bytes = self.0.iter();
+        while let Some(&c) = bytes.next() {
+            if c == b'\\' {
+                // The parser guarantees a backslash is always followed by the escaped byte.
+                if let Some(&escaped) = bytes.next() {
+                    out.push(escaped);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        Cow::Owned(out)
     }
 }
 
@@ -279,5 +332,43 @@ impl fmt::Debug for QuotedText {
         f.debug_tuple("QuotedText")
             .field(&String::from_utf8_lossy(&self.0))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_header_bytes_keeps_quotes() {
+        let token = parse_field(b"abc").unwrap();
+        assert_eq!(token.to_header_bytes().as_ref(), b"abc");
+
+        let quoted = parse_field(br#""a, \"b\"""#).unwrap();
+        assert_eq!(quoted.as_bytes(), br#"a, \"b\""#);
+        assert_eq!(quoted.to_header_bytes().as_ref(), br#""a, \"b\"""#);
+    }
+
+    #[test]
+    fn unescaped() {
+        let token = parse_field(b"abc").unwrap();
+        assert!(matches!(token.unescaped(), Cow::Borrowed(b"abc")));
+
+        let plain = parse_field(b"\"a b\"").unwrap();
+        assert!(matches!(plain.unescaped(), Cow::Borrowed(b"a b")));
+
+        let escaped = parse_field(br#""\[::1\]:\"x\"\\""#).unwrap();
+        assert_eq!(escaped.unescaped().as_ref(), br#"[::1]:"x"\"#);
+    }
+
+    #[test]
+    fn combine_values_roundtrip() {
+        let input = br#"abc, "d, e", "f\"g""#;
+        let values = parse_header(input, b',').unwrap();
+        assert_eq!(values.len(), 3);
+
+        let combined = combine_values(&values, b',');
+        assert_eq!(combined, input);
+        assert_eq!(parse_header(&combined, b',').unwrap(), values);
     }
 }

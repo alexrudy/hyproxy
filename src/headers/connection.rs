@@ -1,16 +1,23 @@
 //! Handle connection headers.
-
-use std::{collections::HashSet, sync::Arc};
+//!
+//! The `Connection` header lists connection options, and names other headers which apply only
+//! to the current connection
+//! ([RFC 9110 section 7.6.1](https://datatracker.ietf.org/doc/html/rfc9110#section-7.6.1)).
+//!
+//! [`ConnectionHeader`] parses the entries of a `Connection` header, for use with a
+//! [`HeaderChain`]. To remove connection-scoped headers before
+//! forwarding a message, use [`StripHopByHop`](super::hopby::StripHopByHop).
 
 use bytes::Bytes;
-use nom::character::complete::char;
-use nom::combinator::map;
-use nom::multi::separated_list0;
+use nom::character::complete::{char, space0};
+use nom::combinator::{map, opt};
+use nom::multi::many0;
+use nom::sequence::{delimited, pair, preceded};
 use nom::IResult;
 use thiserror::Error;
 
-use super::chain::HeaderRecordKind;
-use super::parser::{strip_whitespace, NoTail};
+use super::chain::{HeaderChain, HeaderRecordKind, RecordEntry};
+use super::parser::NoTail;
 
 /// Close is a pseudo-header that can appear in the CONNECTION header's value,
 /// indicating that the other side would like to close the connection after this request.
@@ -22,7 +29,8 @@ pub const UPGRADE: http::HeaderName = http::header::UPGRADE;
 /// The HTTP CONNECTION header.
 pub const CONNECTION: http::HeaderName = http::header::CONNECTION;
 
-const CONNECTION_UPGRADE: http::HeaderValue = http::HeaderValue::from_static("upgrade");
+/// The `Connection: upgrade` header value.
+pub(crate) const CONNECTION_UPGRADE: http::HeaderValue = http::HeaderValue::from_static("upgrade");
 
 /// A header named in `CONNECTION`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -52,7 +60,7 @@ impl ConnectionHeader {
     }
 }
 
-/// An error occured while parsing connection headers.
+/// An error occurred while parsing connection headers.
 #[derive(Debug, Error)]
 #[error("Failed to parse connection header: {0:?}")]
 pub struct ConnectionHeaderParseError(nom::error::Error<Bytes>);
@@ -65,13 +73,13 @@ impl HeaderRecordKind for ConnectionHeader {
     type Error = ConnectionHeaderParseError;
 
     fn into_bytes(self) -> Vec<u8> {
-        todo!()
+        self.header.as_str().as_bytes().to_vec()
     }
 
     fn parse_header_value(
         header: &http::HeaderValue,
     ) -> Result<Vec<super::chain::Record<Self>>, Self::Error> {
-        parser()(header.as_bytes())
+        parser(header.as_bytes())
             .no_tail()
             .map(|headers| headers.into_iter().map(Into::into).collect())
             .map_err(|error| {
@@ -83,20 +91,56 @@ impl HeaderRecordKind for ConnectionHeader {
     }
 }
 
-fn parser<'v>() -> impl FnMut(&'v [u8]) -> IResult<&'v [u8], Vec<ConnectionHeader>> {
+/// Parse `Connection = #connection-option`, where `connection-option = token`.
+///
+/// Empty list elements (`a, , b`) are accepted and ignored, as RFC 9110 section 5.6.1.2
+/// requires of recipients.
+fn parser(input: &[u8]) -> IResult<&[u8], Vec<ConnectionHeader>> {
+    let option = || {
+        map(super::parser::token(), |token| {
+            http::HeaderName::from_bytes(token.as_bytes())
+                .expect("every RFC 9110 token is a valid header name")
+                .into()
+        })
+    };
+    let separator = || delimited(space0, char(','), space0);
+
     map(
-        separated_list0(char(','), strip_whitespace(super::parser::token())),
-        |headers| {
-            headers
+        delimited(
+            space0,
+            pair(opt(option()), many0(preceded(separator(), opt(option())))),
+            space0,
+        ),
+        |(first, rest)| {
+            first
                 .into_iter()
-                .map(|header| {
-                    http::HeaderName::from_bytes(header.as_bytes())
-                        .unwrap()
-                        .into()
-                })
+                .chain(rest.into_iter().flatten())
                 .collect()
         },
-    )
+    )(input)
+}
+
+/// All connection options named in every `Connection` header line, as header names (and
+/// so compared case-insensitively).
+pub(crate) fn connection_options(headers: &http::HeaderMap) -> Vec<http::HeaderName> {
+    let mut names = Vec::new();
+    for record in HeaderChain::<ConnectionHeader>::from_headers(headers).flat_iter() {
+        match record.entry() {
+            RecordEntry::Value(option) => names.push(option.header().clone()),
+            // Be lenient with lines that don't parse: still use any names they contain.
+            RecordEntry::Raw(raw) => names.extend(
+                raw.split(|&c| c == b',')
+                    .filter_map(|name| http::HeaderName::from_bytes(name.trim_ascii()).ok()),
+            ),
+        }
+    }
+    names
+}
+
+/// Whether the message requests an upgrade: `Connection` includes `upgrade`, and an
+/// `Upgrade` header is present.
+pub(crate) fn is_upgrade(headers: &http::HeaderMap) -> bool {
+    headers.contains_key(UPGRADE) && connection_options(headers).contains(&UPGRADE)
 }
 
 impl From<http::HeaderName> for ConnectionHeader {
@@ -113,337 +157,106 @@ impl TryFrom<http::HeaderValue> for ConnectionHeader {
     }
 }
 
-/// Configuration for removing connection headers.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
-pub struct RemoveConnectionHeadersConfig {
-    keep_upgrade: bool,
-    preserve_if_upgrade: bool,
-    preserve_if_close: bool,
-}
-
-/// A layer to remove connection headers in requests and responses.
-#[derive(Debug, Clone)]
-pub struct RemoveConnectionHeadersLayer {
-    request: HashSet<http::HeaderName>,
-    response: HashSet<http::HeaderName>,
-    config: RemoveConnectionHeadersConfig,
-}
-
-impl RemoveConnectionHeadersLayer {
-    /// Create a new `RemoveConnectionHeadersLayer`.
-    pub fn new(config: RemoveConnectionHeadersConfig) -> Self {
-        Self {
-            request: HashSet::new(),
-            response: HashSet::new(),
-            config,
-        }
-    }
-
-    /// Add a header to be removed during requests and responses.
-    pub fn add_header(&mut self, header: http::HeaderName) {
-        self.request.insert(header.clone());
-        self.response.insert(header);
-    }
-
-    /// Add the CONNECTION header to be removed during requests and responses.
-    pub fn add_connection_header(&mut self) {
-        self.request.insert(http::header::CONNECTION);
-        self.response.insert(http::header::CONNECTION);
-    }
-
-    /// Remove a header from being removed during requests and responses.
-    pub fn remove_header(&mut self, header: &http::HeaderName) {
-        self.request.remove(header);
-        self.response.remove(header);
-    }
-
-    /// Configure to keep the UPGRADE header when present.
-    pub fn keep_upgrade(&mut self, keep_upgrade: bool) {
-        self.config.keep_upgrade = keep_upgrade;
-    }
-
-    /// Add a request header to be removed.
-    pub fn add_request_header(&mut self, header: http::HeaderName) {
-        self.request.insert(header);
-    }
-
-    /// Remove a request header from being removed.
-    pub fn remove_request_header(&mut self, header: &http::HeaderName) {
-        self.request.remove(header);
-    }
-
-    /// Add a response header to be removed.
-    pub fn add_response_header(&mut self, header: http::HeaderName) {
-        self.response.insert(header);
-    }
-
-    /// Remove a response header from being removed.
-    pub fn remove_response_header(&mut self, header: &http::HeaderName) {
-        self.response.remove(header);
-    }
-
-    /// Clear the set of request headers to be removed.
-    pub fn clear_request_headers(&mut self) {
-        self.request.clear();
-    }
-
-    /// Clear the set of response headers to be removed.
-    pub fn clear_response_headers(&mut self) {
-        self.response.clear();
-    }
-}
-
-impl<S> tower::layer::Layer<S> for RemoveConnectionHeadersLayer {
-    type Service = RemoveConnectionHeaders<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        RemoveConnectionHeaders {
-            inner,
-            config: Arc::new(self.config.clone()),
-            request: Arc::new(self.request.clone()),
-            response: Arc::new(self.response.clone()),
-        }
-    }
-}
-
-/// A service to remove connection headers in requests and responses.
-#[derive(Debug, Clone)]
-pub struct RemoveConnectionHeaders<S> {
-    inner: S,
-    config: Arc<RemoveConnectionHeadersConfig>,
-    request: Arc<HashSet<http::HeaderName>>,
-    response: Arc<HashSet<http::HeaderName>>,
-}
-
-impl<S> RemoveConnectionHeaders<S> {
-    /// Create a new `RemoveConnectionHeadersLayer`.
-    pub fn new(
-        inner: S,
-        config: RemoveConnectionHeadersConfig,
-        headers: HashSet<http::HeaderName>,
-    ) -> Self {
-        let headers = Arc::new(headers);
-        Self {
-            inner,
-            config: Arc::new(config),
-            request: headers.clone(),
-            response: headers,
-        }
-    }
-
-    /// Remove related headers from the request.
-    pub fn remove_request_headers(&self, headers: &mut http::HeaderMap) {
-        remove_headers(&self.config, &self.request, headers);
-    }
-
-    /// Remove related headers from the response.
-    pub fn remove_response_headers(&self, headers: &mut http::HeaderMap) {
-        remove_headers(&self.config, &self.response, headers);
-    }
-}
-
-fn remove_headers(
-    config: &RemoveConnectionHeadersConfig,
-    targets: &HashSet<http::HeaderName>,
-    headers: &mut http::HeaderMap,
-) {
-    for header in targets.iter() {
-        process_header(config, header, headers);
-    }
-}
-
-fn process_header(
-    config: &RemoveConnectionHeadersConfig,
-    name: &http::HeaderName,
-    headers: &mut http::HeaderMap,
-) {
-    if let Some(original_value) = headers.remove(name) {
-        if let Ok(referenced_headers) = ConnectionHeader::parse_header_value(&original_value) {
-            if config.preserve_if_upgrade || config.preserve_if_close {
-                for header in &referenced_headers {
-                    if config.preserve_if_upgrade && header.value().is_some_and(|r| r.is_upgrade())
-                    {
-                        headers.insert(CONNECTION, original_value);
-                        return;
-                    }
-                    if config.preserve_if_close && header.value().is_some_and(|r| r.is_close()) {
-                        headers.insert(CONNECTION, original_value);
-                        return;
-                    }
-                }
-            }
-
-            for header in referenced_headers {
-                if config.keep_upgrade && header.value().is_some_and(|r| r.is_upgrade()) {
-                    headers.insert(CONNECTION, CONNECTION_UPGRADE);
-                    continue;
-                }
-
-                if header.value().is_some_and(|r| r.is_close()) {
-                    continue;
-                }
-
-                if let Some(target) = header.into_value() {
-                    headers.remove(target.header());
-                }
-            }
-        }
-    }
-}
-
-impl<S, BIn, BOut> tower::Service<http::Request<BIn>> for RemoveConnectionHeaders<S>
-where
-    S: tower::Service<http::Request<BIn>, Response = http::Response<BOut>>,
-{
-    type Response = http::Response<BOut>;
-    type Error = S::Error;
-    type Future = future::RemoveConnectionHeadersFuture<S::Future, S::Error, BOut>;
-
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, request: http::Request<BIn>) -> Self::Future {
-        let mut request = request;
-        self.remove_request_headers(request.headers_mut());
-        future::RemoveConnectionHeadersFuture {
-            inner: self.inner.call(request),
-            headers: self.request.clone(),
-            config: self.config.clone(),
-            error: std::marker::PhantomData,
-        }
-    }
-}
-
-mod future {
-    use std::{collections::HashSet, future::Future, sync::Arc, task::ready};
-
-    pin_project_lite::pin_project! {
-        #[derive(Debug)]
-        pub struct RemoveConnectionHeadersFuture<F, E, BOut> {
-            #[pin]
-            pub(super) inner: F,
-            pub(super) headers: Arc<HashSet<http::HeaderName>>,
-            pub(super) config: Arc<super::RemoveConnectionHeadersConfig>,
-            pub(super) error: std::marker::PhantomData<fn() -> (BOut, E)>
-        }
-    }
-
-    impl<F, E, BOut> Future for RemoveConnectionHeadersFuture<F, E, BOut>
-    where
-        F: Future<Output = Result<http::Response<BOut>, E>>,
-    {
-        type Output = Result<http::Response<BOut>, E>;
-
-        fn poll(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Self::Output> {
-            let mut outcome = ready!(self.as_mut().project().inner.poll(cx));
-
-            if let Ok(respoonse) = &mut outcome {
-                super::remove_headers(&self.config, &self.headers, respoonse.headers_mut());
-            }
-
-            std::task::Poll::Ready(outcome)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-
     use super::*;
+    use crate::headers::chain::{HeaderChain, IntoRecordValue as _};
 
     #[test]
     fn parse_connection_headers() {
-        let headers = b"close, upgrade";
-        let headers = parser()(headers).no_tail().unwrap();
+        let headers = parser(b"close, upgrade").no_tail().unwrap();
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].header(), http::HeaderName::from_static("close"));
+        assert!(headers[0].is_close());
         assert_eq!(headers[1].header(), http::header::UPGRADE);
+        assert!(headers[1].is_upgrade());
     }
 
     #[test]
-    fn remove_connection_headers() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::CONNECTION, "close, upgrade".parse().unwrap());
-        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
-
-        let config = RemoveConnectionHeadersConfig {
-            keep_upgrade: false,
-            ..Default::default()
-        };
-        let mut targets = HashSet::new();
-        targets.insert(http::header::CONNECTION);
-        remove_headers(&config, &targets, &mut headers);
-        assert_eq!(headers.len(), 0);
+    fn parse_connection_headers_case_insensitive() {
+        let headers = parser(b"Keep-Alive, UPGRADE").no_tail().unwrap();
+        assert_eq!(headers[0].header(), "keep-alive");
+        assert!(headers[1].is_upgrade());
     }
 
     #[test]
-    fn remove_connection_headers_keep_upgrade() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::CONNECTION, "close, upgrade".parse().unwrap());
-        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
-
-        let config = RemoveConnectionHeadersConfig {
-            keep_upgrade: true,
-            ..Default::default()
-        };
-        let mut targets = HashSet::new();
-        targets.insert(http::header::CONNECTION);
-        remove_headers(&config, &targets, &mut headers);
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers.get(http::header::UPGRADE).unwrap(), "websocket");
+    fn parse_connection_headers_empty_elements() {
+        for input in [&b""[..], b",", b" a , , b ,", b", a", b"a,,b"] {
+            let headers = parser(input)
+                .no_tail()
+                .unwrap_or_else(|error| panic!("{:?}: {error:?}", String::from_utf8_lossy(input)));
+            assert!(headers.len() <= 2, "{:?}", String::from_utf8_lossy(input));
+        }
+        assert_eq!(parser(b" a , , b ,").no_tail().unwrap().len(), 2);
     }
 
     #[test]
-    fn preserve_connection_headers() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::CONNECTION,
-            "keep-alive, upgrade".parse().unwrap(),
-        );
-        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
-        headers.insert("keep-alive", "timeout=5, max=200".parse().unwrap());
+    fn parse_connection_headers_rejects_non_tokens() {
+        for input in [&b"a b"[..], b"a;b", b"\"quoted\""] {
+            assert!(
+                parser(input).no_tail().is_err(),
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
 
-        let config = RemoveConnectionHeadersConfig {
-            preserve_if_upgrade: true,
-            ..Default::default()
-        };
-        let mut targets = HashSet::new();
-        targets.insert(http::header::CONNECTION);
-        remove_headers(&config, &targets, &mut headers);
-        assert_eq!(headers.len(), 3);
+    #[test]
+    fn parse_connection_headers_all_token_characters() {
+        // Every token character must be accepted as a header name, rather than panicking.
+        let input = b"abcXYZ019!#$%&'*+-.^_`|~";
+        let headers = parser(input).no_tail().unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].header(), "abcxyz019!#$%&'*+-.^_`|~");
+    }
+
+    #[test]
+    fn connection_options_all_lines_case_insensitive() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(CONNECTION, "keep-alive, Upgrade".parse().unwrap());
+        headers.append(CONNECTION, "X-Custom, , close".parse().unwrap());
+        headers.append(CONNECTION, "not a token, x-raw".parse().unwrap());
+
         assert_eq!(
-            headers.get(http::header::CONNECTION).unwrap(),
-            "keep-alive, upgrade"
+            connection_options(&headers),
+            ["keep-alive", "upgrade", "x-custom", "close", "x-raw"]
         );
-        assert_eq!(headers.get(http::header::UPGRADE).unwrap(), "websocket");
-        assert_eq!(headers.get("keep-alive").unwrap(), "timeout=5, max=200");
     }
 
     #[test]
-    fn preserve_close() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::CONNECTION, "close, upgrade".parse().unwrap());
-        headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
-
-        let config = RemoveConnectionHeadersConfig {
-            preserve_if_close: true,
-            ..Default::default()
+    fn is_upgrade_detection() {
+        let upgrade = |connection: &[&str], upgrade: Option<&str>| {
+            let mut headers = http::HeaderMap::new();
+            for line in connection {
+                headers.append(CONNECTION, line.parse().unwrap());
+            }
+            if let Some(upgrade) = upgrade {
+                headers.insert(UPGRADE, upgrade.parse().unwrap());
+            }
+            is_upgrade(&headers)
         };
-        let mut targets = HashSet::new();
-        targets.insert(http::header::CONNECTION);
-        remove_headers(&config, &targets, &mut headers);
-        assert_eq!(headers.len(), 2);
-        assert_eq!(
-            headers.get(http::header::CONNECTION).unwrap(),
-            "close, upgrade"
-        );
-        assert_eq!(headers.get(http::header::UPGRADE).unwrap(), "websocket");
+
+        // Browsers capitalise the option (Firefox also includes keep-alive).
+        assert!(upgrade(&["Upgrade"], Some("websocket")));
+        assert!(upgrade(&["keep-alive, Upgrade"], Some("websocket")));
+        assert!(upgrade(&["keep-alive", "upgrade"], Some("websocket")));
+
+        assert!(!upgrade(&["Upgrade"], None));
+        assert!(!upgrade(&["close"], Some("websocket")));
+        assert!(!upgrade(&[], Some("websocket")));
+    }
+
+    #[test]
+    fn connection_header_roundtrip() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(CONNECTION, "close, upgrade".parse().unwrap());
+        headers.append(CONNECTION, "keep-alive".parse().unwrap());
+
+        let chain = HeaderChain::<ConnectionHeader>::try_from_headers(&headers).unwrap();
+        let values: Vec<_> = chain
+            .into_iter()
+            .map(|header| header.into_header_value())
+            .collect();
+        assert_eq!(values, ["close, upgrade", "keep-alive"]);
     }
 }
