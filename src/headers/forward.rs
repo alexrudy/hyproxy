@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::{AddrParseError, IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -418,39 +418,84 @@ impl HeaderRecordKind for Forwarded {
     }
 }
 
+/// Parsers for the RFC 7239 section 4 grammar:
+///
+/// ```text
+/// Forwarded         = 1#forwarded-element
+/// forwarded-element = [ forwarded-pair ] *( ";" [ forwarded-pair ] )
+/// forwarded-pair    = token "=" value
+/// value             = token / quoted-string
+/// ```
+///
+/// Optional whitespace is tolerated around `;` and `,` (the RFC's own examples
+/// use it), but not around `=`. Empty pairs and empty list elements are accepted
+/// and ignored, as RFC 7230 section 7 requires of recipients.
 mod parse {
 
-    use nom::character::complete::char;
-    use nom::multi::separated_list1;
-    use nom::sequence::separated_pair;
+    use nom::character::complete::{char, space0};
+    use nom::combinator::{map, opt};
+    use nom::multi::many0;
+    use nom::sequence::{delimited, pair, preceded, separated_pair};
     use nom::IResult;
 
     use crate::headers::fields::{FieldKey, FieldValue};
-    use crate::headers::parser::{key, record, strip_whitespace};
-
-    fn forwarded_key_value<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], (FieldKey, FieldValue)>
-    {
-        separated_pair(
-            strip_whitespace(key()),
-            char('='),
-            strip_whitespace(record()),
-        )
-    }
+    use crate::headers::parser::{key, record};
 
     pub type ForwardedRecord = Vec<(FieldKey, FieldValue)>;
 
-    pub(super) fn forwarded_record<'a>(
-    ) -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], ForwardedRecord> {
-        separated_list1(char(';'), forwarded_key_value())
+    fn forwarded_pair(input: &[u8]) -> IResult<&[u8], (FieldKey, FieldValue)> {
+        separated_pair(key(), char('='), record())(input)
+    }
+
+    fn separator(c: char) -> impl FnMut(&[u8]) -> IResult<&[u8], char> {
+        move |input| delimited(space0, char(c), space0)(input)
+    }
+
+    /// A single `forwarded-element`. Always succeeds, possibly with no pairs.
+    fn forwarded_element(input: &[u8]) -> IResult<&[u8], ForwardedRecord> {
+        map(
+            pair(
+                opt(forwarded_pair),
+                many0(preceded(separator(';'), opt(forwarded_pair))),
+            ),
+            |(first, rest)| {
+                first
+                    .into_iter()
+                    .chain(rest.into_iter().flatten())
+                    .collect()
+            },
+        )(input)
+    }
+
+    /// A single `forwarded-element`, with surrounding whitespace.
+    pub(super) fn forwarded_record(input: &[u8]) -> IResult<&[u8], ForwardedRecord> {
+        delimited(space0, forwarded_element, space0)(input)
+    }
+
+    /// A full `Forwarded` header value. Empty elements are dropped.
+    pub(super) fn forwarded_records(input: &[u8]) -> IResult<&[u8], Vec<ForwardedRecord>> {
+        map(
+            delimited(
+                space0,
+                pair(
+                    forwarded_element,
+                    many0(preceded(separator(','), forwarded_element)),
+                ),
+                space0,
+            ),
+            |(first, rest)| {
+                std::iter::once(first)
+                    .chain(rest)
+                    .filter(|element| !element.is_empty())
+                    .collect()
+            },
+        )(input)
     }
 }
 
 impl Forwarded {
     fn parse_bytes(value: &[u8]) -> Result<Vec<Record<Self>>, ParseForwardedError> {
-        use nom::character::complete::char;
-        use nom::multi::separated_list0;
-
-        separated_list0(char(','), self::parse::forwarded_record())(value)
+        parse::forwarded_records(value)
             .finish()
             .no_tail()
             .map_err(|error| ParseForwardedError {
@@ -498,16 +543,16 @@ impl Forwarded {
             .transpose()?;
         let host = data
             .remove(&ForwardedKey::HOST)
-            .map(|value| ForwardedHost::parse_bytes(value.as_bytes()))
+            .map(|value| ForwardedHost::parse_bytes(&value.unescaped()))
             .transpose()?;
 
         let proto = data
             .remove(&ForwardedKey::PROTO)
             .map(|value| {
-                let v =
-                    std::str::from_utf8(value.as_bytes()).map_err(|error| ParseForwardedError {
-                        kind: ParseForwadingErrorKind::NonUtf8Proto { error },
-                    })?;
+                let value = value.unescaped();
+                let v = std::str::from_utf8(&value).map_err(|error| ParseForwardedError {
+                    kind: ParseForwadingErrorKind::NonUtf8Proto { error },
+                })?;
 
                 ForwardedProtocol::from_str(v).map_err(|error| ParseForwardedError {
                     kind: ParseForwadingErrorKind::InvalidScheme {
@@ -531,7 +576,7 @@ impl Forwarded {
     where
         Self: Sized,
     {
-        let records = parse::forwarded_record()(value)
+        let records = parse::forwarded_record(value)
             .finish()
             .no_tail()
             .map_err(|error| ParseForwardedError {
@@ -621,7 +666,10 @@ where
 /// Most implemenetations should provide either the `Secret` or `Address` variant.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum Forwardee {
-    /// The request was forwarded on a named interface.
+    /// The request was forwarded on a named (obfuscated) interface.
+    ///
+    /// The token is stored without the leading `_`. RFC 7239 restricts it to
+    /// `ALPHA / DIGIT / "." / "_" / "-"`, which is narrower than [`Token`].
     Named(Token),
 
     /// The request was forwarded on an IP address.
@@ -660,29 +708,37 @@ impl Forwardee {
 impl TryFrom<FieldValue> for Forwardee {
     type Error = ParseForwardedError;
 
+    /// Parse a `node` (RFC 7239 section 6). The value may be a token or a
+    /// quoted-string; both forms are interpreted identically.
     fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
-        if let Ok(data) = std::str::from_utf8(value.as_bytes()) {
-            if data == "unknown" {
-                return Ok(Forwardee::Unknown);
-            }
+        let node = value.unescaped();
 
-            if let Ok(addr) = ForwardAddress::from_str(data) {
-                return Ok(Forwardee::Address(addr));
-            }
+        // ABNF string literals are case-insensitive (RFC 5234 section 2.3).
+        if node.eq_ignore_ascii_case(b"unknown") {
+            return Ok(Forwardee::Unknown);
         }
 
-        if value.token().is_some() && value.as_bytes().first().is_some_and(|b| *b == b'_') {
-            let token = value.into_token().unwrap();
-
-            return Ok(Forwardee::Named(Token::new(token.into_bytes().slice(1..))));
+        if let Some(name) = node.strip_prefix(b"_") {
+            // obfnode = "_" 1*( ALPHA / DIGIT / "." / "_" / "-")
+            if !name.is_empty() && name.iter().all(|&c| is_obfnode_char(c)) {
+                return Ok(Forwardee::Named(Token::new(Bytes::copy_from_slice(name))));
+            }
+        } else if let Some(addr) = std::str::from_utf8(&node)
+            .ok()
+            .and_then(|s| s.parse::<ForwardAddress>().ok())
+        {
+            return Ok(Forwardee::Address(addr));
         }
 
         Err(ParseForwardedError {
-            kind: ParseForwadingErrorKind::InvalidForwardee(Bytes::copy_from_slice(
-                value.as_bytes(),
-            )),
+            kind: ParseForwadingErrorKind::InvalidForwardee(Bytes::copy_from_slice(&node)),
         })
     }
+}
+
+/// Characters permitted after the leading `_` of an `obfnode` or `obfport`.
+const fn is_obfnode_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-'
 }
 
 impl From<SocketAddr> for Forwardee {
@@ -855,67 +911,69 @@ enum ErrorKind {
 
     #[error("invalid port for forwarded address")]
     Port(std::num::ParseIntError),
+
+    #[error("invalid port for forwarded address: expected 1 to 5 digits")]
+    InvalidPort,
 }
 
 impl FromStr for ForwardAddress {
     type Err = ForwardParseError;
 
+    /// Parse an IP-address `node` (RFC 7239 section 6):
+    ///
+    /// ```text
+    /// node     = nodename [ ":" node-port ]
+    /// nodename = IPv4address / "[" IPv6address "]"
+    /// port     = 1*5DIGIT
+    /// ```
+    ///
+    /// The value may optionally be wrapped in double quotes.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = |kind| ForwardParseError { kind };
+
         let addr = value
-            .strip_prefix("\"")
-            .and_then(|s| s.strip_suffix("\""))
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
             .unwrap_or(value);
 
-        let (ip, port) = if addr.starts_with('[') && addr.contains(']') {
-            if !addr.chars().filter(|c| *c == '[' || *c == ']').count() == 2 {
-                return Err(ForwardParseError {
-                    kind: ErrorKind::InvalidIpv6Address,
-                });
-            }
-
-            let (addr, port) = addr
-                .strip_prefix('[')
-                .ok_or(ForwardParseError {
-                    kind: ErrorKind::InvalidIpv6Address,
-                })?
+        let (ip, port) = if let Some(rest) = addr.strip_prefix('[') {
+            let (ip, rest) = rest
                 .split_once(']')
-                .ok_or(ForwardParseError {
-                    kind: ErrorKind::InvalidIpv6Address,
-                })?;
+                .ok_or(invalid(ErrorKind::InvalidIpv6Address))?;
 
-            let port = if let Some(port) = port.strip_prefix(':') {
-                if port.is_empty() {
-                    return Err(ForwardParseError {
-                        kind: ErrorKind::InvalidIpv6Address,
-                    });
-                }
-
-                Some(port)
-            } else {
+            let port = if rest.is_empty() {
                 None
+            } else {
+                Some(
+                    rest.strip_prefix(':')
+                        .ok_or(invalid(ErrorKind::InvalidIpv6Address))?,
+                )
             };
 
-            let ip: Ipv6Addr = addr.parse().map_err(|error| ForwardParseError {
-                kind: ErrorKind::Address(error),
-            })?;
-
+            let ip: Ipv6Addr = ip
+                .parse()
+                .map_err(|error| invalid(ErrorKind::Address(error)))?;
             (IpAddr::V6(ip), port)
         } else {
-            let (ip, port) = value
-                .rsplit_once(':')
-                .map(|(ip, port)| (ip, Some(port)))
-                .unwrap_or((addr, None));
-            let ip: IpAddr = ip.parse().map_err(|error| ForwardParseError {
-                kind: ErrorKind::Address(error),
-            })?;
-            (ip, port)
+            // IPv6 addresses must be bracketed, so anything else must be IPv4.
+            let (ip, port) = match addr.split_once(':') {
+                Some((ip, port)) => (ip, Some(port)),
+                None => (addr, None),
+            };
+
+            let ip: Ipv4Addr = ip
+                .parse()
+                .map_err(|error| invalid(ErrorKind::Address(error)))?;
+            (IpAddr::V4(ip), port)
         };
 
         let port = port
-            .map(|s| {
-                s.parse::<u16>().map_err(|err| ForwardParseError {
-                    kind: ErrorKind::Port(err),
-                })
+            .map(|port| {
+                if port.is_empty() || port.len() > 5 || !port.bytes().all(|c| c.is_ascii_digit()) {
+                    return Err(invalid(ErrorKind::InvalidPort));
+                }
+                port.parse::<u16>()
+                    .map_err(|error| invalid(ErrorKind::Port(error)))
             })
             .transpose()?;
 
@@ -1049,6 +1107,9 @@ pub enum ForwardeeMode {
     Address,
 
     /// The interface should be displayed as a named interface.
+    ///
+    /// The name is emitted with a leading `_`, and should only contain
+    /// `ALPHA / DIGIT / "." / "_" / "-"` to be a valid RFC 7239 `obfnode`.
     Named(Token),
 
     /// The interface should be displayed as an unknown interface.
@@ -1931,6 +1992,150 @@ mod tests {
             chain.flat_iter().all(|record| record.value().is_some()),
             "emitted header should parse cleanly: {chain:?}"
         );
+    }
+
+    #[test]
+    fn parse_obfuscated_identifier() {
+        // `for="_gazonk"` is the example from RFC 7239 section 4.
+        for input in ["for=_gazonk", "for=\"_gazonk\"", r#"for="\_gazonk""#] {
+            let forwarded: Forwarded = input.parse().unwrap();
+            assert_eq!(
+                forwarded.r#for,
+                Some(Forwardee::Named(Token::from_static("gazonk"))),
+                "{input}"
+            );
+        }
+
+        let forwarded: Forwarded = "for=_hidden.proxy-1_a".parse().unwrap();
+        assert_eq!(forwarded.to_bytes().as_ref(), b"for=_hidden.proxy-1_a");
+    }
+
+    #[test]
+    fn parse_invalid_obfuscated_identifier() {
+        // obfnode = "_" 1*( ALPHA / DIGIT / "." / "_" / "-")
+        for input in ["for=_", "for=_a!b", "for=_a~b", "for=\"_a b\"", "for=\"_\""] {
+            assert!(input.parse::<Forwarded>().is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn parse_unknown_case_insensitive() {
+        for input in [
+            "for=unknown",
+            "for=UNKNOWN",
+            "for=Unknown",
+            "for=\"unknown\"",
+        ] {
+            let forwarded: Forwarded = input.parse().unwrap();
+            assert_eq!(forwarded.r#for, Some(Forwardee::Unknown), "{input}");
+        }
+    }
+
+    #[test]
+    fn parse_forwarded_address_quoted_ipv4() {
+        assert_eq!(
+            "\"192.0.2.1:8080\"".parse::<ForwardAddress>().unwrap(),
+            ForwardAddress::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))).with_port(8080)
+        );
+        assert_eq!(
+            "\"192.0.2.1\"".parse::<ForwardAddress>().unwrap(),
+            ForwardAddress::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+        );
+    }
+
+    #[test]
+    fn parse_forwarded_address_invalid() {
+        for input in [
+            // Trailing data after the IPv6 bracket.
+            "[::1]junk",
+            "[::1]]",
+            "[::1]:",
+            "[[::1]",
+            "[::1",
+            // IPv6 must be bracketed; IPv4 must not be.
+            "::1",
+            "2001:db8::17",
+            "[192.0.2.1]",
+            // port = 1*5DIGIT, and must fit in a u16.
+            "192.0.2.1:",
+            "192.0.2.1:+80",
+            "192.0.2.1:080080",
+            "192.0.2.1:65536",
+            "192.0.2.1:80:80",
+            "[::1]:+80",
+            "",
+        ] {
+            assert!(input.parse::<ForwardAddress>().is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_escaped_quoted_values() {
+        let forwarded: Forwarded = r#"for="\[::1\]:8080";host="example.com\:8080";proto="\https""#
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            forwarded.r#for,
+            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080).into())
+        );
+        assert_eq!(
+            forwarded.host,
+            Some(ForwardedHost::new("example.com".into(), Some(8080)))
+        );
+        assert_eq!(forwarded.proto, Some(http::uri::Scheme::HTTPS.into()));
+    }
+
+    #[test]
+    fn parse_empty_pairs() {
+        let expected = Forwarded {
+            r#for: Some(Forwardee::Unknown),
+            proto: Some(http::uri::Scheme::HTTP.into()),
+            ..Default::default()
+        };
+
+        for input in [
+            "for=unknown;;proto=http",
+            ";for=unknown;proto=http",
+            "for=unknown;proto=http;",
+            "for=unknown ; ; proto=http",
+        ] {
+            assert_eq!(input.parse::<Forwarded>().unwrap(), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn parse_empty_list_elements() {
+        for (input, count) in [
+            ("for=_a,,for=_b", 2),
+            (", for=_a", 1),
+            ("for=_a,", 1),
+            ("for=_a , , for=_b ,", 2),
+            ("for=_a;, for=_b", 2),
+            ("", 0),
+            (",", 0),
+        ] {
+            let records = Forwarded::parse_bytes(input.as_bytes())
+                .unwrap_or_else(|error| panic!("{input:?}: {error}"));
+            assert_eq!(records.len(), count, "{input:?}");
+            assert!(records.iter().all(|r| r.value().is_some()), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_whitespace_around_separators() {
+        let records =
+            Forwarded::parse_bytes(b" for=_a ; proto=http , for=_b\t;\tby=unknown ").unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn parse_rejects_whitespace_around_equals() {
+        // forwarded-pair = token "=" value
+        for input in ["for =unknown", "for= unknown", "for = unknown"] {
+            assert!(input.parse::<Forwarded>().is_err(), "{input}");
+            assert!(Forwarded::parse_bytes(input.as_bytes()).is_err(), "{input}");
+        }
     }
 
     #[tokio::test]

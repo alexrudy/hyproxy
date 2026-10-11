@@ -3,6 +3,7 @@
 //! Header field values are delimiter separated sequences of tokens and quoted strings,
 //! defined in [RFC 7230](https://tools.ietf.org/html/rfc7230#section-3.2.6).
 use core::fmt;
+use std::borrow::Cow;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use thiserror::Error;
@@ -58,6 +59,17 @@ impl FieldValue {
         match &self.0 {
             Entry::Token(token) => token.as_bytes(),
             Entry::QuotedText(quoted) => quoted.as_bytes(),
+        }
+    }
+
+    /// Get the semantic content of the field value.
+    ///
+    /// For tokens this is the token itself; for quoted strings this is the
+    /// text between the quotes with escape sequences decoded.
+    pub fn unescaped(&self) -> Cow<'_, [u8]> {
+        match &self.0 {
+            Entry::Token(token) => Cow::Borrowed(token.as_bytes()),
+            Entry::QuotedText(quoted) => quoted.unescaped(),
         }
     }
 
@@ -286,8 +298,32 @@ impl QuotedText {
     }
 
     /// Get the quoted text as a byte slice.
+    ///
+    /// This is the text between the surrounding quotes, with any
+    /// `quoted-pair` escape sequences left intact. See [`QuotedText::unescaped`].
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Get the quoted text with `quoted-pair` escape sequences (`\x`) decoded.
+    pub fn unescaped(&self) -> Cow<'_, [u8]> {
+        if !self.0.contains(&b'\\') {
+            return Cow::Borrowed(&self.0);
+        }
+
+        let mut out = Vec::with_capacity(self.0.len());
+        let mut bytes = self.0.iter();
+        while let Some(&c) = bytes.next() {
+            if c == b'\\' {
+                // The parser guarantees a backslash is always followed by the escaped byte.
+                if let Some(&escaped) = bytes.next() {
+                    out.push(escaped);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        Cow::Owned(out)
     }
 }
 
@@ -311,6 +347,18 @@ mod tests {
         let quoted = parse_field(br#""a, \"b\"""#).unwrap();
         assert_eq!(quoted.as_bytes(), br#"a, \"b\""#);
         assert_eq!(quoted.to_header_bytes().as_ref(), br#""a, \"b\"""#);
+    }
+
+    #[test]
+    fn unescaped() {
+        let token = parse_field(b"abc").unwrap();
+        assert!(matches!(token.unescaped(), Cow::Borrowed(b"abc")));
+
+        let plain = parse_field(b"\"a b\"").unwrap();
+        assert!(matches!(plain.unescaped(), Cow::Borrowed(b"a b")));
+
+        let escaped = parse_field(br#""\[::1\]:\"x\"\\""#).unwrap();
+        assert_eq!(escaped.unescaped().as_ref(), br#"[::1]:"x"\"#);
     }
 
     #[test]
