@@ -393,11 +393,12 @@ mod future {
                             protocols.matching(response_protocol)
                         })
                     {
-                        let response_upgraded = hyper::upgrade::on(response);
-                        let request_upgraded = this.request_upgrade.on.take().unwrap();
+                        // The request came from the client; the response from the upstream.
+                        let upstream_upgraded = hyper::upgrade::on(response);
+                        let client_upgraded = this.request_upgrade.on.take().unwrap();
 
                         tokio::spawn(async move {
-                            let upstream_io = match request_upgraded.await {
+                            let client_io = match client_upgraded.await {
                                 Ok(upgraded) => {
                                     tracing::debug!("Request upgraded");
                                     upgraded
@@ -409,7 +410,7 @@ mod future {
                                 }
                             };
 
-                            let downstream_io = match response_upgraded.await {
+                            let upstream_io = match upstream_upgraded.await {
                                 Ok(upgraded) => {
                                     tracing::debug!("Response upgraded");
                                     upgraded
@@ -421,9 +422,10 @@ mod future {
                                 }
                             };
 
+                            // Returns (client -> upstream, upstream -> client) byte counts.
                             match copy_bidirectional(
+                                &mut TokioIo::new(client_io),
                                 &mut TokioIo::new(upstream_io),
-                                &mut TokioIo::new(downstream_io),
                             )
                             .await
                             {

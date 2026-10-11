@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `websocket/1 != websocket/2`). The lenient comparison is available as
   `UpgradeProtocol::matches`, which `UpgradeRequest::matching` uses, so upgrade matching is
   unchanged. `UpgradeProtocol` now implements `Eq`.
+- **Breaking:** `SetViaHeader::request` and `SetViaHeader::response` are now builder methods taking
+  an `AppendHeaderRecordMode`, matching `SetViaHeaderLayer`, rather than returning `&mut`. To
+  migrate, replace `*service.request() = mode` with `service = service.request(mode)`.
+- `BailService::service` is deprecated in favour of `BailService::inner`.
+- `HeaderChain::append_record` no longer requires `T: Debug`, and the `(C, Request<B>)` service
+  implementation of `ProxyUriService` no longer requires `B: Send + 'static`.
+- `ParseViaError` messages are now consistently lower-case and mention the `Via` header.
+
 - `ProxyUpgrade` logs unparseable client `Upgrade` headers and failed client upgrades at `debug`
   level, and failed upstream upgrades at `warn`, rather than `error`.
 - The `ProxyUriLayer` and `ProxyUriService` documentation now states that the scheme always
@@ -178,6 +186,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Via::{new, with_comment, protocol, address, comment, to_bytes}`, `Display for Via`, and
   `ViaProtocol::{new, name, version}`, so `Via` entries can be built and inspected.
 - `UpgradeProtocol::matches`.
+- `inner` and `into_inner` on `BailService`, `SetViaHeader` and `ProxyUriService`, matching the
+  other middleware.
 - `upgrade` module documentation covering its requirements: a Tokio runtime, hyper on both
   sides, and `ConnectionHeaders::PreserveUpgrade` when used with `StripHopByHop`.
 - `ConnectionScheme` request extension, used for the `proto` field of the `Forwarded` header.

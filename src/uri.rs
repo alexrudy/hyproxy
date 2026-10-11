@@ -104,7 +104,12 @@ impl<S> ProxyUriService<S> {
         self.authority.as_ref()
     }
 
-    /// Unwrap the inner service
+    /// Returns a reference to the inner service.
+    pub fn inner(&self) -> &S {
+        &self.service
+    }
+
+    /// Returns the inner service, consuming this middleware.
     pub fn into_inner(self) -> S {
         self.service
     }
@@ -175,7 +180,6 @@ where
 impl<S, C, B> tower::Service<(C, http::Request<B>)> for ProxyUriService<S>
 where
     S: tower::Service<(C, http::Request<B>)>,
-    B: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;

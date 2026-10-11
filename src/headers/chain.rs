@@ -317,7 +317,6 @@ where
     pub fn append_record<R>(mode: &AppendHeaderRecordMode, record: R, headers: &mut http::HeaderMap)
     where
         R: Into<Record<T>>,
-        T: Debug,
     {
         let mut chain = Self::from_headers(headers);
         headers.remove(T::HEADER_NAME);

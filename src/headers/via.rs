@@ -236,15 +236,15 @@ pub enum ParseViaError {
     InvalidToken(#[from] InvalidValue),
 
     /// An error occurred parsing the header.
-    #[error("parsing error: {0:?}")]
+    #[error("invalid Via header: {0:?}")]
     ParserError(nom::error::Error<Bytes>),
 
     /// The header has only one (space separated) part, missing either the protocol or the address.
-    #[error("Missing address, only protocol found")]
+    #[error("missing address in Via header, only protocol found")]
     MissingAddress,
 
     /// The header contains characters in an invalid encoding.
-    #[error("Header Encoding")]
+    #[error("invalid encoding in Via header")]
     HeaderEncoding,
 
     /// A comment contains characters which are not permitted, or unbalanced parentheses.
@@ -465,13 +465,15 @@ impl SetViaHeaderLayer {
         }
     }
 
-    /// Set whether to add the Via header to requests.
+    /// Set how the `Via` header is added to requests, which also controls how existing
+    /// `Via` headers are treated. Use [`AppendHeaderRecordMode::Omit`] to not add one.
     pub fn request(mut self, request: AppendHeaderRecordMode) -> Self {
         self.request = request;
         self
     }
 
-    /// Set whether to add the Via header to responses.
+    /// Set how the `Via` header is added to responses, which also controls how existing
+    /// `Via` headers are treated. Use [`AppendHeaderRecordMode::Omit`] to not add one.
     pub fn response(mut self, response: AppendHeaderRecordMode) -> Self {
         self.response = response;
         self
@@ -482,12 +484,9 @@ impl<S> tower::layer::Layer<S> for SetViaHeaderLayer {
     type Service = SetViaHeader<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        SetViaHeader {
-            inner,
-            address: self.address.clone(),
-            request: self.request.clone(),
-            response: self.response.clone(),
-        }
+        SetViaHeader::new(inner, self.address.clone())
+            .request(self.request.clone())
+            .response(self.response.clone())
     }
 }
 
@@ -511,14 +510,30 @@ impl<S> SetViaHeader<S> {
         }
     }
 
-    /// A mutable reference to the request VIA header mode.
-    pub fn request(&mut self) -> &mut AppendHeaderRecordMode {
-        &mut self.request
+    /// Set how the `Via` header is added to requests.
+    ///
+    /// See [`SetViaHeaderLayer::request`].
+    pub fn request(mut self, request: AppendHeaderRecordMode) -> Self {
+        self.request = request;
+        self
     }
 
-    /// A mutable reference to the response VIA header mode.
-    pub fn response(&mut self) -> &mut AppendHeaderRecordMode {
-        &mut self.response
+    /// Set how the `Via` header is added to responses.
+    ///
+    /// See [`SetViaHeaderLayer::response`].
+    pub fn response(mut self, response: AppendHeaderRecordMode) -> Self {
+        self.response = response;
+        self
+    }
+
+    /// Returns a reference to the inner service.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    /// Returns the inner service, consuming this middleware.
+    pub fn into_inner(self) -> S {
+        self.inner
     }
 }
 
@@ -731,6 +746,24 @@ mod tests {
                 ViaProtocol::parse_bytes(format!("HTTP/{expected}").as_bytes()).unwrap()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn via_header_service_builder() {
+        let service = SetViaHeader::new(
+            tower::service_fn(via_service(None)),
+            "localhost:8080".parse().unwrap(),
+        )
+        .request(AppendHeaderRecordMode::Omit)
+        .response(AppendHeaderRecordMode::KeepLast);
+
+        let response = service.oneshot(http::Request::new(())).await.unwrap();
+        let chain = ViaChain::from_headers(response.headers());
+        assert_eq!(chain.flat_iter().count(), 1);
+        assert_eq!(
+            chain.last_record().unwrap().value().unwrap().address(),
+            &"localhost:8080".parse::<ViaAddress>().unwrap()
+        );
     }
 
     #[test]
