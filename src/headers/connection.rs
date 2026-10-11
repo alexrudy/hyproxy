@@ -5,7 +5,7 @@
 //! ([RFC 9110 section 7.6.1](https://datatracker.ietf.org/doc/html/rfc9110#section-7.6.1)).
 //!
 //! [`ConnectionHeader`] parses the entries of a `Connection` header, for use with a
-//! [`HeaderChain`](super::chain::HeaderChain). To remove connection-scoped headers before
+//! [`HeaderChain`]. To remove connection-scoped headers before
 //! forwarding a message, use [`StripHopByHop`](super::hopby::StripHopByHop).
 
 use bytes::Bytes;
@@ -16,7 +16,7 @@ use nom::sequence::{delimited, pair, preceded};
 use nom::IResult;
 use thiserror::Error;
 
-use super::chain::HeaderRecordKind;
+use super::chain::{HeaderChain, HeaderRecordKind, RecordEntry};
 use super::parser::NoTail;
 
 /// Close is a pseudo-header that can appear in the CONNECTION header's value,
@@ -120,6 +120,29 @@ fn parser(input: &[u8]) -> IResult<&[u8], Vec<ConnectionHeader>> {
     )(input)
 }
 
+/// All connection options named in every `Connection` header line, as header names (and
+/// so compared case-insensitively).
+pub(crate) fn connection_options(headers: &http::HeaderMap) -> Vec<http::HeaderName> {
+    let mut names = Vec::new();
+    for record in HeaderChain::<ConnectionHeader>::from_headers(headers).flat_iter() {
+        match record.entry() {
+            RecordEntry::Value(option) => names.push(option.header().clone()),
+            // Be lenient with lines that don't parse: still use any names they contain.
+            RecordEntry::Raw(raw) => names.extend(
+                raw.split(|&c| c == b',')
+                    .filter_map(|name| http::HeaderName::from_bytes(name.trim_ascii()).ok()),
+            ),
+        }
+    }
+    names
+}
+
+/// Whether the message requests an upgrade: `Connection` includes `upgrade`, and an
+/// `Upgrade` header is present.
+pub(crate) fn is_upgrade(headers: &http::HeaderMap) -> bool {
+    headers.contains_key(UPGRADE) && connection_options(headers).contains(&UPGRADE)
+}
+
 impl From<http::HeaderName> for ConnectionHeader {
     fn from(header: http::HeaderName) -> Self {
         Self { header }
@@ -185,6 +208,42 @@ mod tests {
         let headers = parser(input).no_tail().unwrap();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].header(), "abcxyz019!#$%&'*+-.^_`|~");
+    }
+
+    #[test]
+    fn connection_options_all_lines_case_insensitive() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(CONNECTION, "keep-alive, Upgrade".parse().unwrap());
+        headers.append(CONNECTION, "X-Custom, , close".parse().unwrap());
+        headers.append(CONNECTION, "not a token, x-raw".parse().unwrap());
+
+        assert_eq!(
+            connection_options(&headers),
+            ["keep-alive", "upgrade", "x-custom", "close", "x-raw"]
+        );
+    }
+
+    #[test]
+    fn is_upgrade_detection() {
+        let upgrade = |connection: &[&str], upgrade: Option<&str>| {
+            let mut headers = http::HeaderMap::new();
+            for line in connection {
+                headers.append(CONNECTION, line.parse().unwrap());
+            }
+            if let Some(upgrade) = upgrade {
+                headers.insert(UPGRADE, upgrade.parse().unwrap());
+            }
+            is_upgrade(&headers)
+        };
+
+        // Browsers capitalise the option (Firefox also includes keep-alive).
+        assert!(upgrade(&["Upgrade"], Some("websocket")));
+        assert!(upgrade(&["keep-alive, Upgrade"], Some("websocket")));
+        assert!(upgrade(&["keep-alive", "upgrade"], Some("websocket")));
+
+        assert!(!upgrade(&["Upgrade"], None));
+        assert!(!upgrade(&["close"], Some("websocket")));
+        assert!(!upgrade(&[], Some("websocket")));
     }
 
     #[test]

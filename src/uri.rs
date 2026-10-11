@@ -1,17 +1,27 @@
-//! Layer to fix the scheme of the request URI when
+//! Layer to set the scheme and authority of the request URI when
 //! passing through a proxy.
 //!
-//! Sometimes, the client may not set the scheme of the URI
-//! when sending a request. This can be a problem when the
-//! request is being proxied, as the upstream may require
-//! the scheme to be set. This layer can be used to set
-//! the scheme of the URI to a default value when it is
-//! not set.
+//! Servers usually receive HTTP/1.1 requests in origin-form (`GET /path`), with the
+//! authority in the `Host` header rather than the URI. A client sending the request on to
+//! the upstream needs an absolute URI. [`ProxyUriService`] rewrites the request URI to use
+//! the configured scheme and an authority, keeping the path and query.
+//!
+//! The authority is taken from the first of:
+//!
+//! 1. An [`http::uri::Authority`] in the request extensions.
+//! 2. The authority configured on the layer.
+//! 3. The request URI's authority.
+//! 4. The `Host` header.
+//!
+//! If no authority is found, or the request has no path (for example, a `CONNECT` request
+//! in authority-form), the URI is left unchanged.
 
-/// A layer that sets the scheme of the URI to a default,
-/// and optionally sets the authority of the URI.
+/// A layer that sets the scheme of the request URI, and optionally overrides its authority.
 ///
-/// Defaults to `http` via the `Default` implementation.
+/// The scheme always replaces any scheme in the request URI. See the
+/// [module documentation](self) for how the authority is chosen.
+///
+/// Defaults to `http`, with no authority override, via the `Default` implementation.
 #[derive(Debug, Clone)]
 pub struct ProxyUriLayer {
     scheme: http::uri::Scheme,
@@ -52,7 +62,9 @@ impl<S> tower::layer::Layer<S> for ProxyUriLayer {
     }
 }
 
-/// A service that sets the scheme of the URI to a default.
+/// A service that sets the scheme and authority of the request URI.
+///
+/// See the [module documentation](self) for details.
 #[derive(Debug, Clone)]
 pub struct ProxyUriService<S> {
     scheme: http::uri::Scheme,
@@ -98,17 +110,43 @@ impl<S> ProxyUriService<S> {
     }
 
     fn apply<B>(&self, req: &mut http::Request<B>) {
-        let mut uri = req.uri().clone().into_parts();
-        let authority = req
-            .extensions()
-            .get()
+        let Some(authority) = self.authority_for(req) else {
+            tracing::debug!(uri = %req.uri(), "no authority for request, leaving URI unchanged");
+            return;
+        };
+
+        let mut parts = req.uri().clone().into_parts();
+        if parts.path_and_query.is_none() {
+            // Authority-form (e.g. `CONNECT example.com:443`) has no path, and cannot have a scheme.
+            tracing::debug!(uri = %req.uri(), "no path for request, leaving URI unchanged");
+            return;
+        }
+
+        parts.scheme = Some(self.scheme.clone());
+        parts.authority = Some(authority);
+
+        match http::Uri::from_parts(parts) {
+            Ok(uri) => *req.uri_mut() = uri,
+            Err(error) => {
+                tracing::debug!(uri = %req.uri(), %error, "unable to set scheme and authority");
+            }
+        }
+    }
+
+    fn authority_for<B>(&self, req: &http::Request<B>) -> Option<http::uri::Authority> {
+        req.extensions()
+            .get::<http::uri::Authority>()
             .or(self.authority.as_ref())
-            .or(uri.authority.as_ref());
-
-        uri.authority = authority.cloned();
-        uri.scheme = Some(self.scheme.clone());
-
-        *req.uri_mut() = http::Uri::from_parts(uri).expect("valid uri with scheme");
+            .or(req.uri().authority())
+            .cloned()
+            .or_else(|| {
+                let host = req.headers().get(http::header::HOST)?.as_bytes();
+                // `Host` is `uri-host [ ":" port ]`, which does not permit userinfo.
+                if host.contains(&b'@') {
+                    return None;
+                }
+                http::uri::Authority::try_from(host).ok()
+            })
     }
 }
 
@@ -194,6 +232,83 @@ mod tests {
         assert_eq!(
             req.uri().authority(),
             Some(&http::uri::Authority::from_static("proxy.example.com"))
+        );
+    }
+
+    #[test]
+    fn test_apply_origin_form_uses_host_header() {
+        let mut req = http::Request::get("/path?query=1")
+            .header(http::header::HOST, "example.com:8080")
+            .body(())
+            .unwrap();
+        let uri_service = ProxyUriService::new(http::uri::Scheme::HTTPS, None, ());
+        uri_service.apply(&mut req);
+        assert_eq!(req.uri(), "https://example.com:8080/path?query=1");
+    }
+
+    #[test]
+    fn test_apply_configured_authority_overrides_host_header() {
+        let mut req = http::Request::get("/path")
+            .header(http::header::HOST, "example.com")
+            .body(())
+            .unwrap();
+        let uri_service = ProxyUriService::new(
+            http::uri::Scheme::HTTP,
+            Some(http::uri::Authority::from_static("upstream.internal")),
+            (),
+        );
+        uri_service.apply(&mut req);
+        assert_eq!(req.uri(), "http://upstream.internal/path");
+    }
+
+    #[test]
+    fn test_apply_without_authority_leaves_uri_unchanged() {
+        for host in [None, Some("user@example.com"), Some("not a host")] {
+            let mut req = http::Request::get("/path").body(()).unwrap();
+            if let Some(host) = host {
+                req.headers_mut()
+                    .insert(http::header::HOST, host.parse().unwrap());
+            }
+            let uri_service = ProxyUriService::new(http::uri::Scheme::HTTP, None, ());
+            uri_service.apply(&mut req);
+            assert_eq!(req.uri(), "/path", "{host:?}");
+        }
+    }
+
+    #[test]
+    fn test_apply_authority_form_leaves_uri_unchanged() {
+        let mut req = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("example.com:443")
+            .body(())
+            .unwrap();
+        let uri_service = ProxyUriService::new(
+            http::uri::Scheme::HTTP,
+            Some(http::uri::Authority::from_static("proxy.example.com")),
+            (),
+        );
+        uri_service.apply(&mut req);
+        assert_eq!(req.uri(), "example.com:443");
+    }
+
+    #[tokio::test]
+    async fn test_service_default_layer_origin_form() {
+        use tower::{Layer as _, ServiceExt as _};
+
+        // Previously panicked with `AuthorityMissing`.
+        let service =
+            ProxyUriLayer::default().layer(tower::service_fn(
+                |req: http::Request<()>| async move {
+                    Ok::<_, std::convert::Infallible>(req.uri().clone())
+                },
+            ));
+        let req = http::Request::get("/path")
+            .header(http::header::HOST, "example.com")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            service.oneshot(req).await.unwrap(),
+            "http://example.com/path"
         );
     }
 

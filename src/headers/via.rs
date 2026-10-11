@@ -199,7 +199,12 @@ fn address<'v>() -> impl FnMut(&'v [u8]) -> nom::IResult<&'v [u8], ViaAddress> {
     strip_whitespace(alt((address, pseudonym)))
 }
 
-/// The name or address of the proxy.
+/// The name or address of the proxy (`received-by` in
+/// [RFC 9110 section 7.6.3](https://datatracker.ietf.org/doc/html/rfc9110#section-7.6.3)).
+///
+/// RFC 9110 defines `received-by = pseudonym [ ":" port ]` with `pseudonym = token`, so a
+/// host must be a valid token. Host names and IPv4 addresses are, but IPv6 addresses are not
+/// and cannot be represented: use a pseudonym instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViaAddress {
     /// The host and port of the proxy.
@@ -243,7 +248,10 @@ impl ViaAddress {
         Ok(ViaAddress::Pseudonym(name))
     }
 
-    /// Create a ViaAddress from a URI.
+    /// Create a ViaAddress from a URI's host and port.
+    ///
+    /// Returns `Ok(None)` if the URI has no authority, and an error if the host is not a
+    /// valid token (for example, an IPv6 address).
     pub fn from_uri(uri: &http::Uri) -> Result<Option<Self>, InvalidValue> {
         let authority = uri.authority();
         if let Some(authority) = authority {
@@ -267,12 +275,17 @@ impl FromStr for ViaAddress {
     }
 }
 
-impl From<SocketAddr> for ViaAddress {
-    fn from(addr: SocketAddr) -> Self {
-        ViaAddress::HostAndPort(
-            Token::parse(addr.ip().to_string().as_bytes()).unwrap(),
+impl TryFrom<SocketAddr> for ViaAddress {
+    type Error = InvalidValue;
+
+    /// Use the address and port as the `received-by` value.
+    ///
+    /// IPv4 addresses are valid tokens. IPv6 addresses are not, and return an error.
+    fn try_from(addr: SocketAddr) -> Result<Self, Self::Error> {
+        Ok(ViaAddress::HostAndPort(
+            Token::parse(addr.ip().to_string().as_bytes())?,
             Some(addr.port()),
-        )
+        ))
     }
 }
 
@@ -453,6 +466,32 @@ mod tests {
     use crate::headers::chain::{Header, IntoRecordValue};
 
     use super::*;
+
+    #[test]
+    fn via_address_from_socket_addr() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8080);
+        let address = ViaAddress::try_from(v4).unwrap();
+        assert_eq!(
+            address,
+            ViaAddress::HostAndPort(Token::from_static("192.0.2.1"), Some(8080))
+        );
+        assert_eq!(address.into_bytes().as_ref(), b"192.0.2.1:8080");
+
+        // Previously panicked: IPv6 addresses are not RFC 9110 tokens.
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080);
+        assert!(ViaAddress::try_from(v6).is_err());
+    }
+
+    #[test]
+    fn via_address_from_ipv6_uri_is_error() {
+        assert!(ViaAddress::from_uri(&"http://[::1]:8080/".parse().unwrap()).is_err());
+        assert_eq!(
+            ViaAddress::from_uri(&"/path".parse().unwrap()).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn via_address_named() {

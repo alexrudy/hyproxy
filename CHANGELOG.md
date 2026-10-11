@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `ProxyUriService` no longer panics on origin-form requests (`GET /path`) when no authority is
+  configured. It now falls back to the `Host` header for the authority, and leaves the URI
+  unchanged if there is no authority, or no path (as for `CONNECT` requests).
+- `ProxyUpgrade` now detects upgrade requests from browsers, which send `Connection: Upgrade`
+  (capitalised). `Connection` options are compared case-insensitively, as RFC 9110 requires, and
+  every `Connection` and `Upgrade` header line is read.
 - `StripHopByHop` now reads every `Connection` header line. Previously only the first was used,
   so headers named on later lines were forwarded.
 - `StripHopByHop` now removes `Keep-Alive`, `Proxy-Connection` and `Upgrade` even when
@@ -62,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `StripHopByHopLayer::new().connection_headers(ConnectionHeaders::Preserve)`, or
     `ConnectionHeaders::PreserveUpgrade` to forward only upgrades.
   - `StripHopByHop::new(inner, preserve)` → `StripHopByHop::new(inner).connection_headers(..)`
+- **Breaking:** `From<SocketAddr> for ViaAddress` is now `TryFrom<SocketAddr>`, as it panicked on
+  IPv6 addresses, which are not valid `received-by` tokens under RFC 9110.
+- The `ProxyUriLayer` and `ProxyUriService` documentation now states that the scheme always
+  replaces the request's scheme, rather than only being set when missing.
 - **Breaking:** `hopby::HOPBYHOP` no longer includes `Trailer`, and is now a `[HeaderName; 4]`.
 - **Breaking:** removed `RemoveConnectionHeaders`, `RemoveConnectionHeadersLayer` and
   `RemoveConnectionHeadersConfig` from `headers::connection`, which duplicated `StripHopByHop`

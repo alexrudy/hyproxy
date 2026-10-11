@@ -66,8 +66,7 @@ pub use http::header::{
     CONNECTION, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRANSFER_ENCODING, UPGRADE,
 };
 
-use super::chain::{HeaderChain, RecordEntry};
-use super::connection::{ConnectionHeader, CONNECTION_UPGRADE};
+use super::connection::{connection_options, is_upgrade, CONNECTION_UPGRADE};
 
 /// Headers which are always hop-by-hop, and are removed by [`StripHopByHop`]
 /// regardless of [`ConnectionHeaders`].
@@ -139,27 +138,6 @@ fn strip_hopbyhop_headers(headers: &mut HeaderMap) {
     for header in HOPBYHOP.iter() {
         headers.remove(header);
     }
-}
-
-/// All headers named in every `Connection` header line.
-fn connection_options(headers: &HeaderMap) -> Vec<HeaderName> {
-    let mut names = Vec::new();
-    for record in HeaderChain::<ConnectionHeader>::from_headers(headers).flat_iter() {
-        match record.entry() {
-            RecordEntry::Value(option) => names.push(option.header().clone()),
-            // Be lenient with lines that don't parse: still strip anything they name.
-            RecordEntry::Raw(raw) => names.extend(
-                raw.split(|&c| c == b',')
-                    .filter_map(|name| HeaderName::from_bytes(name.trim_ascii()).ok()),
-            ),
-        }
-    }
-    names
-}
-
-/// Whether the message requests an upgrade: `Connection: upgrade` and an `Upgrade` header.
-fn is_upgrade(headers: &HeaderMap) -> bool {
-    headers.contains_key(UPGRADE) && connection_options(headers).contains(&UPGRADE)
 }
 
 /// Remove connection-scoped headers according to `mode`. `allow_upgrade` is whether this

@@ -13,6 +13,7 @@ use nom::sequence::tuple;
 use nom::IResult;
 use thiserror::Error;
 
+use crate::headers::connection::is_upgrade;
 use crate::headers::fields::Token;
 use crate::headers::parser::{strip_whitespace, token, NoTail as _};
 /// The `Upgrade` header field allows the sender to specify what protocols they would like to upgrade to.
@@ -55,26 +56,20 @@ fn parse_upgrade_protocols(
         .map_err(Into::into)
 }
 
-fn parse_connection_headers(value: &HeaderValue) -> Result<Vec<Token>, UpgradeProtocolError> {
-    separated_list0(tag(b","), strip_whitespace(token()))(value.as_bytes())
-        .no_tail()
-        .map_err(Into::into)
-}
-
-// Get upgrade state for the inbound request
+/// Get the upgrade requested by a message: the protocols in every `Upgrade` header line, if
+/// `Connection` includes `upgrade` (compared case-insensitively, on any line).
 fn get_upgrade_request(headers: &http::HeaderMap) -> Result<UpgradeRequest, UpgradeProtocolError> {
-    if let Some(connection) = headers.get(http::header::CONNECTION) {
-        let connection_headers = parse_connection_headers(connection)?;
-        if connection_headers.contains(&Token::from_static("upgrade")) {
-            if let Some(upgrade) = headers.get(UPGRADE) {
-                tracing::trace!("Found upgrade header: {:?}", upgrade);
-                return parse_upgrade_protocols(upgrade)
-                    .map(|protocols| UpgradeRequest { protocols });
-            }
-        }
+    if !is_upgrade(headers) {
+        return Ok(Default::default());
     }
 
-    Ok(Default::default())
+    let mut protocols = Vec::new();
+    for upgrade in headers.get_all(UPGRADE) {
+        tracing::trace!("Found upgrade header: {:?}", upgrade);
+        protocols.extend(parse_upgrade_protocols(upgrade)?);
+    }
+
+    Ok(UpgradeRequest { protocols })
 }
 
 fn get_upgrade_response(headers: &http::HeaderMap) -> Option<UpgradeProtocol> {
@@ -431,6 +426,64 @@ mod tests {
         let request = UpgradeRequest { protocols };
 
         assert!(request.matching(&"http/2".parse().unwrap()))
+    }
+
+    fn upgrade_headers(connection: &[&str], upgrade: &[&str]) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for line in connection {
+            headers.append(http::header::CONNECTION, line.parse().unwrap());
+        }
+        for line in upgrade {
+            headers.append(http::header::UPGRADE, line.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn parse_headers_connection_upgrade_case_insensitive() {
+        // Chrome sends `Connection: Upgrade`, Firefox `Connection: keep-alive, Upgrade`.
+        for connection in ["Upgrade", "keep-alive, Upgrade", "UPGRADE", "upgrade"] {
+            let request =
+                get_upgrade_request(&upgrade_headers(&[connection], &["websocket"])).unwrap();
+            assert!(
+                request.matching(&"websocket".parse().unwrap()),
+                "{connection}: {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_headers_multiple_lines() {
+        let request = get_upgrade_request(&upgrade_headers(
+            &["keep-alive", "Upgrade"],
+            &["websocket", "h2c"],
+        ))
+        .unwrap();
+        assert_eq!(request.len(), 2);
+        assert!(request.matching(&"h2c".parse().unwrap()));
+    }
+
+    #[test]
+    fn upgrade_response_is_detected() {
+        let response = get_upgrade_response(&upgrade_headers(&["Upgrade"], &["websocket"]));
+        assert_eq!(response, Some("websocket".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn proxy_upgrade_detects_browser_request() {
+        use tower::{Layer as _, ServiceExt as _};
+
+        let service = ProxyUpgradeLayer::new().layer(tower::service_fn(
+            |req: http::Request<()>| async move {
+                let request = req.extensions().get::<UpgradeRequest>().cloned();
+                Ok::<_, std::convert::Infallible>(http::Response::new(request))
+            },
+        ));
+
+        let mut request = http::Request::new(());
+        *request.headers_mut() = upgrade_headers(&["keep-alive, Upgrade"], &["websocket"]);
+        let upgrade = service.oneshot(request).await.unwrap().into_body().unwrap();
+        assert!(upgrade.matching(&"websocket".parse().unwrap()));
     }
 
     #[test]
