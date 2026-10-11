@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fields::combine_values` preserves quotes on quoted-string values, so its output round-trips
   through `fields::parse_header`.
 - Quoted obfuscated identifiers (e.g. `for="_gazonk"`, the example from RFC 7239 section 4)
-  are now parsed as `Forwardee::Named`.
+  are now parsed as obfuscated nodes.
 - `unknown` is now matched case-insensitively in `for`/`by`.
 - Escape sequences in quoted `for`, `by`, `host` and `proto` values are now decoded before
   the value is interpreted.
@@ -29,9 +29,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address (`[::1]junk`), unbracketed IPv6 addresses, bracketed IPv4 addresses, and ports that
   are not 1 to 5 digits (e.g. `+80`) are now rejected. Quoted IPv4 addresses with a port
   (`"192.0.2.1:8080"`) now parse correctly.
+- `for` and `by` nodes now support the full RFC 7239 section 6 grammar, including obfuscated
+  ports (`"[2001:db8::17]:_p0rt"`) and ports on `unknown` and obfuscated names
+  (`"unknown:8080"`, `"_hidden:_port"`). Previously these caused the whole header value to be
+  treated as an unparsed raw record.
 
 ### Changed
 
+- **Breaking:** `Forwardee` is now a struct of a `NodeName` and an optional `NodePort`, rather
+  than an enum, so that every kind of node can carry a port. To migrate:
+  - `Forwardee::Address(addr)` → `Forwardee::address(addr)` (or `Forwardee::from(addr)`)
+  - `Forwardee::Named(token)` → `Forwardee::obfuscated(token)`
+  - `Forwardee::Unknown` → `Forwardee::unknown()`
+  - Matching on variants → `forwardee.name()` / `forwardee.port()`, or `forwardee.ip()` for
+    the IP address.
+- **Breaking:** `ForwardeeMode::Named` has been renamed to `ForwardeeMode::Obfuscated`, matching
+  the RFC 7239 terminology and `NodeName::Obfuscated`.
+- `ForwardAddress::from_str` now rejects nodes that are valid but cannot be represented as an IP
+  address with a numeric port (e.g. `unknown`, `_hidden`, or an obfuscated port).
 - `ForwardAddress::to_bytes`, `ForwardAddress::as_header_value` and `ForwardAddress`'s `Display`
   implementation now quote IPv4 addresses that include a port (`"192.0.2.1:8080"`).
 - `Forwarded` parsing no longer accepts whitespace around `=` (`for = unknown`), which RFC 7239
@@ -45,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retaining the surrounding quotes for quoted strings.
 - `FieldValue::unescaped` and `QuotedText::unescaped`, which return the value with
   `quoted-pair` escape sequences decoded.
+- `NodeName` and `NodePort` types, and `Forwardee::{new, address, obfuscated, unknown, name, port,
+  ip, with_port, without_port}`.
+- `FromStr` and `Display` for `Forwardee`, `NodeName` and `NodePort`.
 
 ## [0.12.0](https://github.com/alexrudy/hyproxy/compare/v0.11.2...v0.12.0) - 2026-06-05
 

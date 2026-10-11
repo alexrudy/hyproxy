@@ -270,11 +270,11 @@ impl Forwarded {
         let mut proto = None;
 
         if let Some(&remote) = request.extensions().get::<RemoteAddress>() {
-            r#for = Some(Forwardee::Address(remote.0));
+            r#for = Some(Forwardee::address(remote.0));
         }
 
         if let Some(&local) = request.extensions().get::<LocalAddress>() {
-            by = Some(Forwardee::Address(local.0));
+            by = Some(Forwardee::address(local.0));
         }
 
         if let Some(host_header) = request
@@ -658,50 +658,194 @@ where
     }
 }
 
-/// An interface used in a `Forwarded` header chain.
+/// A node in a `Forwarded` header: the value of a `for` or `by` parameter.
 ///
-/// This can be a secret, a named interface, an IP address, or an unknown interface.
+/// A node is a name, optionally followed by a port, as defined in
+/// [RFC 7239 section 6](https://datatracker.ietf.org/doc/html/rfc7239#section-6):
 ///
-/// The `Secret` variant is used to indicate that the request was forwarded without revealing the original interface. It is the default.
-/// Most implemenetations should provide either the `Secret` or `Address` variant.
+/// ```text
+/// node      = nodename [ ":" node-port ]
+/// nodename  = IPv4address / "[" IPv6address "]" / "unknown" / obfnode
+/// node-port = port / obfport
+/// ```
+///
+/// Any kind of name can carry any kind of port, so `unknown:8080`,
+/// `_hidden:_port` and `"[::1]:_port"` are all valid nodes.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub enum Forwardee {
-    /// The request was forwarded on a named (obfuscated) interface.
+pub struct Forwardee {
+    name: NodeName,
+    port: Option<NodePort>,
+}
+
+/// The name portion of a [`Forwardee`] (`nodename` in RFC 7239 section 6).
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum NodeName {
+    /// An IPv4 or IPv6 address.
+    Address(IpAddr),
+
+    /// An obfuscated identifier (`obfnode`), used to identify an interface
+    /// without revealing its address.
     ///
     /// The token is stored without the leading `_`. RFC 7239 restricts it to
     /// `ALPHA / DIGIT / "." / "_" / "-"`, which is narrower than [`Token`].
-    Named(Token),
+    Obfuscated(Token),
 
-    /// The request was forwarded on an IP address.
-    Address(ForwardAddress),
-
-    /// The request was forwarded on an unknown interface.
+    /// The `unknown` identifier, used when the node is not known or is
+    /// intentionally hidden.
     Unknown,
 }
 
-impl Forwardee {
-    /// Create the X-Forwarded header value for the `Forwardee`.
+/// The port portion of a [`Forwardee`] (`node-port` in RFC 7239 section 6).
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum NodePort {
+    /// A numeric port.
+    Port(u16),
+
+    /// An obfuscated port (`obfport`).
     ///
-    /// This will return `None` if the `Forwardee` is not an `Address`.
-    pub fn x_forwarded(&self) -> Option<XForwardee> {
-        match self {
-            Forwardee::Address(addr) => Some(XForwardee(addr.x_forwarded())),
+    /// The token is stored without the leading `_`. RFC 7239 restricts it to
+    /// `ALPHA / DIGIT / "." / "_" / "-"`, which is narrower than [`Token`].
+    Obfuscated(Token),
+}
+
+impl Forwardee {
+    /// Create a new `Forwardee` from a name and an optional port.
+    pub const fn new(name: NodeName, port: Option<NodePort>) -> Self {
+        Self { name, port }
+    }
+
+    /// A node identified by an IP address, with an optional numeric port.
+    pub fn address(addr: ForwardAddress) -> Self {
+        Self {
+            name: NodeName::Address(addr.ip),
+            port: addr.port.map(NodePort::Port),
+        }
+    }
+
+    /// A node identified by an obfuscated name, with no port.
+    ///
+    /// The name is emitted with a leading `_`, and should only contain
+    /// `ALPHA / DIGIT / "." / "_" / "-"` to be a valid RFC 7239 `obfnode`.
+    pub const fn obfuscated(name: Token) -> Self {
+        Self::new(NodeName::Obfuscated(name), None)
+    }
+
+    /// The `unknown` node, with no port.
+    pub const fn unknown() -> Self {
+        Self::new(NodeName::Unknown, None)
+    }
+
+    /// The name of this node.
+    pub fn name(&self) -> &NodeName {
+        &self.name
+    }
+
+    /// The port of this node, if any.
+    pub fn port(&self) -> Option<&NodePort> {
+        self.port.as_ref()
+    }
+
+    /// The IP address of this node, if it is identified by one.
+    pub fn ip(&self) -> Option<IpAddr> {
+        match self.name {
+            NodeName::Address(ip) => Some(ip),
             _ => None,
         }
     }
 
-    /// Convert the `Forwardee` to a byte string.
-    pub fn to_bytes(&self) -> Bytes {
-        match self {
-            Forwardee::Named(token) => {
-                let mut bytes = BytesMut::new();
-                bytes.put_u8(b'_');
-                bytes.put(token.as_bytes());
-                bytes.freeze()
-            }
-            Forwardee::Address(addr) => addr.to_bytes(),
-            Forwardee::Unknown => Bytes::from_static(b"unknown"),
+    /// Set the port of this node.
+    pub fn with_port(self, port: NodePort) -> Self {
+        Self {
+            port: Some(port),
+            ..self
         }
+    }
+
+    /// Remove the port from this node.
+    pub fn without_port(self) -> Self {
+        Self { port: None, ..self }
+    }
+
+    /// Create the X-Forwarded header value for the `Forwardee`.
+    ///
+    /// This will return `None` if the `Forwardee` is not identified by an IP address.
+    pub fn x_forwarded(&self) -> Option<XForwardee> {
+        self.ip()
+            .map(|ip| XForwardee(ForwardAddress::from(ip).x_forwarded()))
+    }
+
+    /// Convert the `Forwardee` to a byte string.
+    ///
+    /// The result is a valid `Forwarded` field value: it is emitted as a token
+    /// where possible, and as a quoted-string otherwise (e.g. for IPv6
+    /// addresses, or any node with a port).
+    pub fn to_bytes(&self) -> Bytes {
+        let node = match &self.port {
+            Some(port) => format!("{}:{}", self.name, port),
+            None => self.name.to_string(),
+        };
+
+        let mut bytes = BytesMut::with_capacity(node.len() + 2);
+        put_field_value(&mut bytes, node.as_bytes());
+        bytes.freeze()
+    }
+
+    /// Parse a node from its unquoted, unescaped text.
+    fn parse_node(node: &str) -> Result<Self, ForwardParseError> {
+        let invalid = |kind| ForwardParseError { kind };
+
+        let (name, port) = if let Some(rest) = node.strip_prefix('[') {
+            let (ip, rest) = rest
+                .split_once(']')
+                .ok_or(invalid(ErrorKind::InvalidIpv6Address))?;
+
+            let ip: Ipv6Addr = ip
+                .parse()
+                .map_err(|error| invalid(ErrorKind::Address(error)))?;
+
+            let port = if rest.is_empty() {
+                None
+            } else {
+                Some(
+                    rest.strip_prefix(':')
+                        .ok_or(invalid(ErrorKind::InvalidIpv6Address))?,
+                )
+            };
+
+            (NodeName::Address(ip.into()), port)
+        } else {
+            let (name, port) = match node.split_once(':') {
+                Some((name, port)) => (name, Some(port)),
+                None => (node, None),
+            };
+
+            (name.parse()?, port)
+        };
+
+        let port = port.map(str::parse).transpose()?;
+        Ok(Self { name, port })
+    }
+}
+
+impl fmt::Display for Forwardee {
+    /// Formats the node as a `Forwarded` field value, quoted if necessary.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `to_bytes` only ever produces ASCII.
+        f.write_str(&String::from_utf8_lossy(&self.to_bytes()))
+    }
+}
+
+impl FromStr for Forwardee {
+    type Err = ForwardParseError;
+
+    /// Parse a node. The value may optionally be wrapped in double quotes.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let node = value
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(value);
+
+        Self::parse_node(node)
     }
 }
 
@@ -713,37 +857,143 @@ impl TryFrom<FieldValue> for Forwardee {
     fn try_from(value: FieldValue) -> Result<Self, Self::Error> {
         let node = value.unescaped();
 
-        // ABNF string literals are case-insensitive (RFC 5234 section 2.3).
-        if node.eq_ignore_ascii_case(b"unknown") {
-            return Ok(Forwardee::Unknown);
-        }
-
-        if let Some(name) = node.strip_prefix(b"_") {
-            // obfnode = "_" 1*( ALPHA / DIGIT / "." / "_" / "-")
-            if !name.is_empty() && name.iter().all(|&c| is_obfnode_char(c)) {
-                return Ok(Forwardee::Named(Token::new(Bytes::copy_from_slice(name))));
-            }
-        } else if let Some(addr) = std::str::from_utf8(&node)
+        std::str::from_utf8(&node)
             .ok()
-            .and_then(|s| s.parse::<ForwardAddress>().ok())
-        {
-            return Ok(Forwardee::Address(addr));
-        }
-
-        Err(ParseForwardedError {
-            kind: ParseForwadingErrorKind::InvalidForwardee(Bytes::copy_from_slice(&node)),
-        })
+            .and_then(|node| Forwardee::parse_node(node).ok())
+            .ok_or_else(|| ParseForwardedError {
+                kind: ParseForwadingErrorKind::InvalidForwardee(Bytes::copy_from_slice(&node)),
+            })
     }
 }
 
-/// Characters permitted after the leading `_` of an `obfnode` or `obfport`.
-const fn is_obfnode_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-'
+impl From<ForwardAddress> for Forwardee {
+    fn from(addr: ForwardAddress) -> Self {
+        Self::address(addr)
+    }
 }
 
 impl From<SocketAddr> for Forwardee {
     fn from(addr: SocketAddr) -> Self {
-        Forwardee::Address(addr.into())
+        Self::address(addr.into())
+    }
+}
+
+impl From<IpAddr> for Forwardee {
+    fn from(ip: IpAddr) -> Self {
+        Self::address(ip.into())
+    }
+}
+
+impl From<NodeName> for Forwardee {
+    fn from(name: NodeName) -> Self {
+        Self::new(name, None)
+    }
+}
+
+/// Characters permitted after the leading `_` of an `obfnode` or `obfport`.
+const fn is_obfuscated_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-'
+}
+
+/// Parse an `obfnode` or `obfport`, returning the identifier without the leading `_`.
+fn parse_obfuscated(value: &str) -> Option<Token> {
+    let name = value.strip_prefix('_')?;
+    (!name.is_empty() && name.bytes().all(is_obfuscated_char))
+        .then(|| Token::new(Bytes::copy_from_slice(name.as_bytes())))
+}
+
+impl fmt::Display for NodeName {
+    /// Formats the name as it appears in a `node`, without any quoting.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NodeName::Address(IpAddr::V4(ip)) => write!(f, "{ip}"),
+            NodeName::Address(IpAddr::V6(ip)) => write!(f, "[{ip}]"),
+            NodeName::Obfuscated(name) => {
+                write!(f, "_{}", String::from_utf8_lossy(name.as_bytes()))
+            }
+            NodeName::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
+impl FromStr for NodeName {
+    type Err = ForwardParseError;
+
+    /// Parse a `nodename`. IPv6 addresses must be enclosed in brackets.
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let invalid = |kind| ForwardParseError { kind };
+
+        // ABNF string literals are case-insensitive (RFC 5234 section 2.3).
+        if name.eq_ignore_ascii_case("unknown") {
+            return Ok(NodeName::Unknown);
+        }
+
+        if name.starts_with('_') {
+            return parse_obfuscated(name)
+                .map(NodeName::Obfuscated)
+                .ok_or(invalid(ErrorKind::InvalidObfuscatedIdentifier));
+        }
+
+        if let Some(ip) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let ip: Ipv6Addr = ip
+                .parse()
+                .map_err(|error| invalid(ErrorKind::Address(error)))?;
+            return Ok(NodeName::Address(ip.into()));
+        }
+
+        // IPv6 addresses must be bracketed, so anything else must be IPv4.
+        let ip: Ipv4Addr = name
+            .parse()
+            .map_err(|error| invalid(ErrorKind::Address(error)))?;
+        Ok(NodeName::Address(ip.into()))
+    }
+}
+
+impl From<IpAddr> for NodeName {
+    fn from(ip: IpAddr) -> Self {
+        NodeName::Address(ip)
+    }
+}
+
+impl fmt::Display for NodePort {
+    /// Formats the port as it appears in a `node`, without the leading `:`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NodePort::Port(port) => write!(f, "{port}"),
+            NodePort::Obfuscated(port) => {
+                write!(f, "_{}", String::from_utf8_lossy(port.as_bytes()))
+            }
+        }
+    }
+}
+
+impl FromStr for NodePort {
+    type Err = ForwardParseError;
+
+    /// Parse a `node-port`: either `1*5DIGIT` or an obfuscated `_` identifier.
+    fn from_str(port: &str) -> Result<Self, Self::Err> {
+        let invalid = |kind| ForwardParseError { kind };
+
+        if port.starts_with('_') {
+            return parse_obfuscated(port)
+                .map(NodePort::Obfuscated)
+                .ok_or(invalid(ErrorKind::InvalidObfuscatedIdentifier));
+        }
+
+        // Checked explicitly because `u16::from_str` also accepts a leading `+`.
+        if port.is_empty() || port.len() > 5 || !port.bytes().all(|c| c.is_ascii_digit()) {
+            return Err(invalid(ErrorKind::InvalidPort));
+        }
+
+        port.parse()
+            .map(NodePort::Port)
+            .map_err(|error| invalid(ErrorKind::Port(error)))
+    }
+}
+
+impl From<u16> for NodePort {
+    fn from(port: u16) -> Self {
+        NodePort::Port(port)
     }
 }
 
@@ -894,7 +1144,7 @@ impl From<IpAddr> for ForwardAddress {
     }
 }
 
-/// An error parsing a `ForwardAddress`.
+/// An error parsing a [`Forwardee`], [`ForwardAddress`], [`NodeName`] or [`NodePort`].
 #[derive(Debug, Error)]
 #[error("{}", .kind)]
 pub struct ForwardParseError {
@@ -914,68 +1164,40 @@ enum ErrorKind {
 
     #[error("invalid port for forwarded address: expected 1 to 5 digits")]
     InvalidPort,
+
+    #[error(
+        "invalid obfuscated identifier: expected '_' followed by ALPHA / DIGIT / '.' / '_' / '-'"
+    )]
+    InvalidObfuscatedIdentifier,
+
+    #[error("forwarded node is not an IP address")]
+    NotAnAddress,
+
+    #[error("forwarded address has an obfuscated port, which cannot be represented numerically")]
+    ObfuscatedPort,
 }
 
 impl FromStr for ForwardAddress {
     type Err = ForwardParseError;
 
-    /// Parse an IP-address `node` (RFC 7239 section 6):
+    /// Parse an IP-address `node` (RFC 7239 section 6) with an optional numeric port.
     ///
-    /// ```text
-    /// node     = nodename [ ":" node-port ]
-    /// nodename = IPv4address / "[" IPv6address "]"
-    /// port     = 1*5DIGIT
-    /// ```
-    ///
-    /// The value may optionally be wrapped in double quotes.
+    /// The value may optionally be wrapped in double quotes. Nodes which are
+    /// valid, but are not IP addresses with numeric ports (e.g. `unknown` or
+    /// `"[::1]:_port"`), are rejected; parse a [`Forwardee`] to accept those.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let invalid = |kind| ForwardParseError { kind };
+        let node: Forwardee = value.parse()?;
 
-        let addr = value
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .unwrap_or(value);
-
-        let (ip, port) = if let Some(rest) = addr.strip_prefix('[') {
-            let (ip, rest) = rest
-                .split_once(']')
-                .ok_or(invalid(ErrorKind::InvalidIpv6Address))?;
-
-            let port = if rest.is_empty() {
-                None
-            } else {
-                Some(
-                    rest.strip_prefix(':')
-                        .ok_or(invalid(ErrorKind::InvalidIpv6Address))?,
-                )
-            };
-
-            let ip: Ipv6Addr = ip
-                .parse()
-                .map_err(|error| invalid(ErrorKind::Address(error)))?;
-            (IpAddr::V6(ip), port)
-        } else {
-            // IPv6 addresses must be bracketed, so anything else must be IPv4.
-            let (ip, port) = match addr.split_once(':') {
-                Some((ip, port)) => (ip, Some(port)),
-                None => (addr, None),
-            };
-
-            let ip: Ipv4Addr = ip
-                .parse()
-                .map_err(|error| invalid(ErrorKind::Address(error)))?;
-            (IpAddr::V4(ip), port)
+        let NodeName::Address(ip) = node.name else {
+            return Err(invalid(ErrorKind::NotAnAddress));
         };
 
-        let port = port
-            .map(|port| {
-                if port.is_empty() || port.len() > 5 || !port.bytes().all(|c| c.is_ascii_digit()) {
-                    return Err(invalid(ErrorKind::InvalidPort));
-                }
-                port.parse::<u16>()
-                    .map_err(|error| invalid(ErrorKind::Port(error)))
-            })
-            .transpose()?;
+        let port = match node.port {
+            None => None,
+            Some(NodePort::Port(port)) => Some(port),
+            Some(NodePort::Obfuscated(_)) => return Err(invalid(ErrorKind::ObfuscatedPort)),
+        };
 
         Ok(ForwardAddress { ip, port })
     }
@@ -1106,11 +1328,11 @@ pub enum ForwardeeMode {
     /// The interface should be displayed as an IP address.
     Address,
 
-    /// The interface should be displayed as a named interface.
+    /// The interface should be displayed as an obfuscated identifier.
     ///
     /// The name is emitted with a leading `_`, and should only contain
     /// `ALPHA / DIGIT / "." / "_" / "-"` to be a valid RFC 7239 `obfnode`.
-    Named(Token),
+    Obfuscated(Token),
 
     /// The interface should be displayed as an unknown interface.
     Unknown,
@@ -1153,25 +1375,27 @@ impl ForwardedHeaderConfig {
 
         match self.by {
             ForwardeeMode::Address => {
-                if !matches!(forwarded.by, Some(Forwardee::Address(_))) {
+                if forwarded.by.as_ref().and_then(Forwardee::ip).is_none() {
                     forwarded.by = None;
                 }
             }
-            ForwardeeMode::Named(ref name) => forwarded.by = Some(Forwardee::Named(name.clone())),
-            ForwardeeMode::Unknown => forwarded.by = Some(Forwardee::Unknown),
+            ForwardeeMode::Obfuscated(ref name) => {
+                forwarded.by = Some(Forwardee::obfuscated(name.clone()))
+            }
+            ForwardeeMode::Unknown => forwarded.by = Some(Forwardee::unknown()),
             ForwardeeMode::Omit => forwarded.by = None,
         }
 
         match self.r#for {
             ForwardeeMode::Address => {
-                if !matches!(forwarded.r#for, Some(Forwardee::Address(_))) {
+                if forwarded.r#for.as_ref().and_then(Forwardee::ip).is_none() {
                     forwarded.r#for = None;
                 }
             }
-            ForwardeeMode::Named(ref name) => {
-                forwarded.r#for = Some(Forwardee::Named(name.clone()))
+            ForwardeeMode::Obfuscated(ref name) => {
+                forwarded.r#for = Some(Forwardee::obfuscated(name.clone()))
             }
-            ForwardeeMode::Unknown => forwarded.r#for = Some(Forwardee::Unknown),
+            ForwardeeMode::Unknown => forwarded.r#for = Some(Forwardee::unknown()),
             ForwardeeMode::Omit => forwarded.r#for = None,
         }
 
@@ -1332,20 +1556,20 @@ mod tests {
     #[test]
     fn forwardee_display() {
         assert_eq!(
-            Forwardee::Address("127.0.0.1".parse().unwrap())
+            Forwardee::address("127.0.0.1".parse().unwrap())
                 .to_bytes()
                 .as_ref(),
             b"127.0.0.1"
         );
         assert_eq!(
-            Forwardee::Address("[::1]:8080".parse().unwrap())
+            Forwardee::address("[::1]:8080".parse().unwrap())
                 .to_bytes()
                 .as_ref(),
             b"\"[::1]:8080\""
         );
-        assert_eq!(Forwardee::Unknown.to_bytes().as_ref(), b"unknown");
+        assert_eq!(Forwardee::unknown().to_bytes().as_ref(), b"unknown");
         assert_eq!(
-            Forwardee::Named(Token::from_static("name"))
+            Forwardee::obfuscated(Token::from_static("name"))
                 .to_bytes()
                 .as_ref(),
             b"_name"
@@ -1383,7 +1607,7 @@ mod tests {
     #[test]
     fn forwarded_bytes() {
         let forwarded = Forwarded {
-            r#for: Some(Forwardee::Address(
+            r#for: Some(Forwardee::address(
                 "[2001:db8:cafe::17]:4711".parse().unwrap(),
             )),
             ..Default::default()
@@ -1395,9 +1619,9 @@ mod tests {
         );
 
         let forwarded = Forwarded {
-            r#for: Some(Forwardee::Address("192.0.2.60".parse().unwrap())),
+            r#for: Some(Forwardee::address("192.0.2.60".parse().unwrap())),
             proto: Some(http::uri::Scheme::HTTP.into()),
-            by: Some(Forwardee::Address("203.0.113.43".parse().unwrap())),
+            by: Some(Forwardee::address("203.0.113.43".parse().unwrap())),
             ..Default::default()
         };
 
@@ -1418,7 +1642,7 @@ mod tests {
         let forwarded = parse_record_str("For=192.0.2.60; pRoTo=https");
 
         let expected = Forwarded {
-            r#for: Some(Forwardee::Address("192.0.2.60".parse().unwrap())),
+            r#for: Some(Forwardee::address("192.0.2.60".parse().unwrap())),
             proto: Some(http::uri::Scheme::HTTPS.into()),
             ..Default::default()
         };
@@ -1445,7 +1669,7 @@ mod tests {
         assert_eq!(
             iter.next().unwrap().into_value().unwrap(),
             Forwarded {
-                r#for: Some(Forwardee::Address("192.0.2.1".parse().unwrap())),
+                r#for: Some(Forwardee::address("192.0.2.1".parse().unwrap())),
                 ..Default::default()
             },
         );
@@ -1453,7 +1677,7 @@ mod tests {
         assert_eq!(
             iter.next().unwrap().into_value().unwrap(),
             Forwarded {
-                r#for: Some(Forwardee::Address(
+                r#for: Some(Forwardee::address(
                     "[2001:db8:cafe::18]:8080".parse().unwrap()
                 )),
                 proto: Some(http::uri::Scheme::HTTPS.into()),
@@ -1464,7 +1688,7 @@ mod tests {
         assert_eq!(
             iter.next().unwrap().into_value().unwrap(),
             Forwarded {
-                r#for: Some(Forwardee::Address("192.0.2.5".parse().unwrap())),
+                r#for: Some(Forwardee::address("192.0.2.5".parse().unwrap())),
                 ..Default::default()
             },
             "Third record at 192.0.2.5",
@@ -1478,9 +1702,9 @@ mod tests {
         let forwarded = "for=192.0.2.60;by=203.0.113.43;proto=http".parse().unwrap();
         assert_eq!(
             Forwarded {
-                r#for: Some(Forwardee::Address("192.0.2.60".parse().unwrap())),
+                r#for: Some(Forwardee::address("192.0.2.60".parse().unwrap())),
                 proto: Some(http::uri::Scheme::HTTP.into()),
-                by: Some(Forwardee::Address("203.0.113.43".parse().unwrap())),
+                by: Some(Forwardee::address("203.0.113.43".parse().unwrap())),
                 ..Default::default()
             },
             forwarded
@@ -1490,7 +1714,7 @@ mod tests {
     #[test]
     fn parse_forwarded_roundtrip() {
         let forwarded = Forwarded {
-            r#for: Some(Forwardee::Address(
+            r#for: Some(Forwardee::address(
                 "[2001:db8:cafe::17]:4711".parse().unwrap(),
             )),
             ..Default::default()
@@ -1503,7 +1727,7 @@ mod tests {
     #[test]
     fn forwarded_x_headers() {
         let forwarded = Forwarded {
-            r#for: Some(Forwardee::Address(
+            r#for: Some(Forwardee::address(
                 "[2001:db8:cafe::17]:4711".parse().unwrap(),
             )),
             ..Default::default()
@@ -1534,7 +1758,7 @@ mod tests {
         assert_eq!(forwarded.by, None);
         assert_eq!(
             forwarded.r#for.as_ref(),
-            Some(&Forwardee::Address(
+            Some(&Forwardee::address(
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080).into()
             ))
         );
@@ -1542,8 +1766,8 @@ mod tests {
         assert_eq!(forwarded.proto, None);
 
         let config = ForwardedHeaderConfig {
-            by: ForwardeeMode::Named(Token::from_static("proxy")),
-            r#for: ForwardeeMode::Named(Token::from_static("client")),
+            by: ForwardeeMode::Obfuscated(Token::from_static("proxy")),
+            r#for: ForwardeeMode::Obfuscated(Token::from_static("client")),
             host: true,
             proto: true,
         };
@@ -1555,11 +1779,11 @@ mod tests {
 
         assert_eq!(
             forwarded.by.as_ref(),
-            Some(&Forwardee::Named(Token::from_static("proxy")))
+            Some(&Forwardee::obfuscated(Token::from_static("proxy")))
         );
         assert_eq!(
             forwarded.r#for.as_ref(),
-            Some(&Forwardee::Named(Token::from_static("client")))
+            Some(&Forwardee::obfuscated(Token::from_static("client")))
         );
         assert_eq!(forwarded.host, None);
         assert_eq!(forwarded.proto, None);
@@ -1574,7 +1798,7 @@ mod tests {
 
         assert_eq!(
             forwarded.r#for.as_ref(),
-            Some(&Forwardee::Address(
+            Some(&Forwardee::address(
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080).into()
             ))
         );
@@ -1676,7 +1900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xforwarded_header_service_named() {
+    async fn xforwarded_header_service_obfuscated() {
         let service = SetForwardedHeader::new(
             tower::service_fn(|req: http::Request<()>| async { Ok::<_, ()>(req) }),
             Default::default(),
@@ -1684,7 +1908,7 @@ mod tests {
             Default::default(),
         )
         .config(ForwardedHeaderConfig {
-            r#for: ForwardeeMode::Named(Token::from_static("example-proxy")),
+            r#for: ForwardeeMode::Obfuscated(Token::from_static("example-proxy")),
             ..Default::default()
         });
 
@@ -1783,7 +2007,7 @@ mod tests {
         assert_eq!(
             iter.next().unwrap().into_value().unwrap(),
             Forwarded {
-                r#for: Some(Forwardee::Address("192.0.2.5".parse().unwrap())),
+                r#for: Some(Forwardee::address("192.0.2.5".parse().unwrap())),
                 proto: Some(http::uri::Scheme::HTTPS.into()),
                 ..Default::default()
             },
@@ -1792,7 +2016,7 @@ mod tests {
         assert_eq!(
             iter.next().unwrap().into_value().unwrap(),
             Forwarded {
-                r#for: Some(Forwardee::Address(
+                r#for: Some(Forwardee::address(
                     "[2001:db8:cafe::17]:4711".parse().unwrap()
                 )),
                 ..Default::default()
@@ -1802,7 +2026,7 @@ mod tests {
         assert_eq!(
             iter.next().unwrap().into_value().unwrap(),
             Forwarded {
-                r#for: Some(Forwardee::Unknown),
+                r#for: Some(Forwardee::unknown()),
                 host: Some("example.com".parse().unwrap()),
                 proto: Some(http::uri::Scheme::HTTP.into()),
                 ..Default::default()
@@ -1840,7 +2064,7 @@ mod tests {
         assert_eq!(
             iter.next().unwrap().into_value().unwrap(),
             Forwarded {
-                r#for: Some(Forwardee::Address("192.0.2.4".parse().unwrap())),
+                r#for: Some(Forwardee::address("192.0.2.4".parse().unwrap())),
                 ..Default::default()
             }
         );
@@ -2001,7 +2225,7 @@ mod tests {
             let forwarded: Forwarded = input.parse().unwrap();
             assert_eq!(
                 forwarded.r#for,
-                Some(Forwardee::Named(Token::from_static("gazonk"))),
+                Some(Forwardee::obfuscated(Token::from_static("gazonk"))),
                 "{input}"
             );
         }
@@ -2027,7 +2251,7 @@ mod tests {
             "for=\"unknown\"",
         ] {
             let forwarded: Forwarded = input.parse().unwrap();
-            assert_eq!(forwarded.r#for, Some(Forwardee::Unknown), "{input}");
+            assert_eq!(forwarded.r#for, Some(Forwardee::unknown()), "{input}");
         }
     }
 
@@ -2069,6 +2293,174 @@ mod tests {
         }
     }
 
+    fn token(name: &'static str) -> Token {
+        Token::from_static(name)
+    }
+
+    #[test]
+    fn parse_node_with_any_port() {
+        let v4: IpAddr = Ipv4Addr::new(192, 0, 2, 1).into();
+        let v6: IpAddr = "2001:db8:cafe::17".parse().unwrap();
+
+        let cases = [
+            (
+                "unknown:8080",
+                Forwardee::new(NodeName::Unknown, Some(NodePort::Port(8080))),
+            ),
+            (
+                "UNKNOWN:_p",
+                Forwardee::new(NodeName::Unknown, Some(NodePort::Obfuscated(token("p")))),
+            ),
+            (
+                "_hidden:80",
+                Forwardee::obfuscated(token("hidden")).with_port(NodePort::Port(80)),
+            ),
+            (
+                "_hidden:_port",
+                Forwardee::obfuscated(token("hidden"))
+                    .with_port(NodePort::Obfuscated(token("port"))),
+            ),
+            (
+                "192.0.2.1:_p0rt",
+                Forwardee::from(v4).with_port(NodePort::Obfuscated(token("p0rt"))),
+            ),
+            (
+                "[2001:db8:cafe::17]:_p0rt",
+                Forwardee::from(v6).with_port(NodePort::Obfuscated(token("p0rt"))),
+            ),
+            ("[2001:db8:cafe::17]", Forwardee::from(v6)),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(input.parse::<Forwardee>().unwrap(), expected, "{input}");
+            assert_eq!(
+                format!("\"{input}\"").parse::<Forwardee>().unwrap(),
+                expected,
+                "quoted {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_node_invalid() {
+        for input in [
+            "",
+            "unknown:",
+            "unknown:+1",
+            "unknown:65536",
+            "unknownx",
+            "_a:_",
+            "_a:_!",
+            "_:80",
+            "[::1]:_",
+            "[::1]_p",
+            "::1",
+            "_a:80:80",
+        ] {
+            assert!(input.parse::<Forwardee>().is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn forwardee_serialization() {
+        let cases = [
+            (Forwardee::unknown(), "unknown"),
+            (
+                Forwardee::unknown().with_port(NodePort::Port(8080)),
+                "\"unknown:8080\"",
+            ),
+            (Forwardee::obfuscated(token("hidden")), "_hidden"),
+            (
+                Forwardee::obfuscated(token("hidden"))
+                    .with_port(NodePort::Obfuscated(token("port"))),
+                "\"_hidden:_port\"",
+            ),
+            (
+                Forwardee::from(IpAddr::V6(Ipv6Addr::LOCALHOST))
+                    .with_port(NodePort::Obfuscated(token("p"))),
+                "\"[::1]:_p\"",
+            ),
+            (
+                Forwardee::from(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 80)),
+                "\"192.0.2.1:80\"",
+            ),
+        ];
+
+        for (forwardee, expected) in cases {
+            assert_eq!(forwardee.to_bytes().as_ref(), expected.as_bytes());
+            assert_eq!(forwardee.to_string(), expected);
+            assert_eq!(expected.parse::<Forwardee>().unwrap(), forwardee);
+
+            let forwarded = Forwarded {
+                r#for: Some(forwardee),
+                ..Default::default()
+            };
+            assert_eq!(roundtrip(&forwarded), forwarded);
+        }
+    }
+
+    #[test]
+    fn forwardee_accessors() {
+        let addr = ForwardAddress::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))).with_port(80);
+        let forwardee = Forwardee::address(addr);
+        assert_eq!(forwardee.ip(), Some(*addr.ip()));
+        assert_eq!(forwardee.port(), Some(&NodePort::Port(80)));
+        assert_eq!(forwardee.name(), &NodeName::Address(*addr.ip()));
+        assert_eq!(forwardee.clone().without_port().port(), None);
+
+        assert_eq!(Forwardee::unknown().ip(), None);
+        assert_eq!(Forwardee::obfuscated(token("x")).ip(), None);
+    }
+
+    #[test]
+    fn forward_address_rejects_non_address_nodes() {
+        for input in ["unknown", "_hidden", "192.0.2.1:_p", "\"[::1]:_p\""] {
+            assert!(input.parse::<Forwardee>().is_ok(), "{input}");
+            assert!(input.parse::<ForwardAddress>().is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn parse_forwarded_obfuscated_port() {
+        let forwarded: Forwarded = "for=\"[2001:db8:cafe::17]:_p0rt\";by=\"_proxy:_in\""
+            .parse()
+            .unwrap();
+
+        let r#for = forwarded.r#for.as_ref().unwrap();
+        assert_eq!(r#for.ip(), Some("2001:db8:cafe::17".parse().unwrap()));
+        assert_eq!(r#for.port(), Some(&NodePort::Obfuscated(token("p0rt"))));
+        assert_eq!(
+            forwarded.by,
+            Some(
+                Forwardee::obfuscated(token("proxy")).with_port(NodePort::Obfuscated(token("in")))
+            )
+        );
+        assert_eq!(roundtrip(&forwarded), forwarded);
+    }
+
+    #[test]
+    fn x_forwarded_for_obfuscated_port() {
+        let forwarded = Forwarded {
+            r#for: Some(
+                Forwardee::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))
+                    .with_port(NodePort::Obfuscated(token("p"))),
+            ),
+            ..Default::default()
+        };
+
+        let mut request = http::Request::new(());
+        forwarded.set_x_forwarded_headers(&mut request);
+        assert_eq!(request.headers().get(X_FORWARDED_FOR).unwrap(), "192.0.2.1");
+
+        let forwarded = Forwarded {
+            r#for: Some(Forwardee::unknown().with_port(NodePort::Port(80))),
+            ..Default::default()
+        };
+        let mut request = http::Request::new(());
+        forwarded.set_x_forwarded_headers(&mut request);
+        assert!(request.headers().get(X_FORWARDED_FOR).is_none());
+    }
+
     #[test]
     fn parse_escaped_quoted_values() {
         let forwarded: Forwarded = r#"for="\[::1\]:8080";host="example.com\:8080";proto="\https""#
@@ -2089,7 +2481,7 @@ mod tests {
     #[test]
     fn parse_empty_pairs() {
         let expected = Forwarded {
-            r#for: Some(Forwardee::Unknown),
+            r#for: Some(Forwardee::unknown()),
             proto: Some(http::uri::Scheme::HTTP.into()),
             ..Default::default()
         };
