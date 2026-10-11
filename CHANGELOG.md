@@ -116,6 +116,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this crate.
 - `SetForwardedHeader::{set_x_headers, append_forwarded_headers, inner, into_inner}`, matching
   the configuration available on `SetForwardedHeaderLayer`.
+- `ForwardedProtocol::{scheme, into_scheme}` and `From<ForwardedProtocol> for http::uri::Scheme`.
+- `X_FORWARDED_PORT` header name constant.
+- `HeaderChain::try_from_headers`, a strict alternative to `from_headers` which returns an error
+  rather than preserving unparseable header values as raw records.
+- `HeaderChain::{first_record, last_record}`, which return the first or last record across all
+  header lines in the chain, skipping empty lines.
 - `ConnectionScheme` request extension, used for the `proto` field of the `Forwarded` header.
   `ConnectionInfoAdapter` inserts `ConnectionScheme(https)` when TLS connection info is present.
 

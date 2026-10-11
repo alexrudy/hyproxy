@@ -37,6 +37,14 @@ pub const X_FORWARDED_HOST: http::HeaderName =
 pub const X_FORWARDED_PROTO: http::HeaderName =
     http::header::HeaderName::from_static("x-forwarded-proto");
 
+/// The `X-Forwarded-Port` header, a de-facto standard header for identifying the port that a
+/// client connected to on your proxy or load balancer.
+///
+/// This is provided for convenience; [`SetForwardedHeader`] does not set it, since `Forwarded`
+/// has no equivalent field (the port is part of `host`, if it was present in the `Host` header).
+pub const X_FORWARDED_PORT: http::HeaderName =
+    http::header::HeaderName::from_static("x-forwarded-port");
+
 /// A collection of values of forwarding information.
 ///
 /// The FORWARDED header can contain multiple comma-separated values, or multiple FORWARDED headers
@@ -1423,12 +1431,22 @@ impl XForwardee {
 pub struct ForwardedProtocol(http::uri::Scheme);
 
 impl ForwardedProtocol {
-    /// Convert the `ForwardProtocol` to a byte string.
+    /// The URI scheme of this protocol.
+    pub fn scheme(&self) -> &http::uri::Scheme {
+        &self.0
+    }
+
+    /// Convert into the URI scheme of this protocol.
+    pub fn into_scheme(self) -> http::uri::Scheme {
+        self.0
+    }
+
+    /// Convert the `ForwardedProtocol` to a byte string.
     pub fn to_bytes(&self) -> Bytes {
         Bytes::copy_from_slice(self.0.as_str().as_bytes())
     }
 
-    /// Create the X-Forwarded header value for the `ForwardProtocol`.
+    /// Create the X-Forwarded header value for the `ForwardedProtocol`.
     pub fn x_forwarded(&self) -> XForwardedProtocol<'_> {
         XForwardedProtocol(self)
     }
@@ -1443,6 +1461,12 @@ impl XForwardedProtocol<'_> {
     /// Convert the `ForwardProtocol` to a `http::HeaderValue`.
     pub fn to_header_value(&self) -> http::HeaderValue {
         http::HeaderValue::from_bytes(self.0.to_bytes().as_ref()).unwrap()
+    }
+}
+
+impl From<ForwardedProtocol> for http::uri::Scheme {
+    fn from(proto: ForwardedProtocol) -> Self {
+        proto.into_scheme()
     }
 }
 
@@ -3353,6 +3377,75 @@ mod tests {
         assert_eq!(
             format!("{:?}", obf_name("proxy")),
             "ObfuscatedName(\"proxy\")"
+        );
+    }
+
+    #[test]
+    fn forwarded_protocol_scheme() {
+        let proto: ForwardedProtocol = "https".parse().unwrap();
+        assert_eq!(proto.scheme(), &http::uri::Scheme::HTTPS);
+        assert_eq!(
+            http::uri::Scheme::from(proto.clone()),
+            http::uri::Scheme::HTTPS
+        );
+        assert_eq!(proto.into_scheme(), http::uri::Scheme::HTTPS);
+    }
+
+    #[test]
+    fn x_forwarded_port_constant() {
+        assert_eq!(X_FORWARDED_PORT.as_str(), "x-forwarded-port");
+    }
+
+    #[test]
+    fn forwarding_chain_try_from_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(FORWARDED, "for=192.0.2.1, for=192.0.2.2".parse().unwrap());
+        headers.append(FORWARDED, "for=192.0.2.3;proto=https".parse().unwrap());
+
+        let chain = ForwardingChain::try_from_headers(&headers).unwrap();
+        assert_eq!(chain, ForwardingChain::from_headers(&headers));
+        assert!(chain.flat_iter().all(|record| record.value().is_some()));
+
+        headers.append(FORWARDED, "not a valid record".parse().unwrap());
+        assert!(ForwardingChain::try_from_headers(&headers).is_err());
+        assert!(
+            ForwardingChain::from_headers(&headers)
+                .last_record()
+                .unwrap()
+                .raw()
+                .is_some(),
+            "the lenient constructor preserves the invalid value as a raw record"
+        );
+
+        assert!(ForwardingChain::try_from_headers(&http::HeaderMap::new())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn forwarding_chain_first_and_last_record() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(FORWARDED, "for=192.0.2.1, for=192.0.2.2".parse().unwrap());
+        headers.append(FORWARDED, "for=192.0.2.3, for=192.0.2.4".parse().unwrap());
+        // An empty header value parses to a header with no records.
+        headers.append(FORWARDED, "".parse().unwrap());
+
+        let chain = ForwardingChain::try_from_headers(&headers).unwrap();
+        assert_eq!(chain.len(), 3);
+
+        let for_ip = |record: Option<&ForwardedRecord>| {
+            record
+                .and_then(ForwardedRecord::value)
+                .and_then(|forwarded| forwarded.r#for.as_ref())
+                .and_then(Forwardee::ip)
+        };
+        assert_eq!(
+            for_ip(chain.first_record()),
+            Some(Ipv4Addr::new(192, 0, 2, 1).into())
+        );
+        assert_eq!(
+            for_ip(chain.last_record()),
+            Some(Ipv4Addr::new(192, 0, 2, 4).into())
         );
     }
 
