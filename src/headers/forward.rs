@@ -17,7 +17,7 @@ use super::fields::{FieldKey, FieldValue, Token};
 use super::chain::{
     AppendHeaderRecordMode, FromRequest, Header, HeaderChain, HeaderRecordKind, Record,
 };
-use super::parser::NoTail;
+use super::parser::{put_field_value, NoTail};
 
 /// The `Forwarded` header, a standard header for identifying the originating IP address of a client connecting to a web server through a proxy server.
 ///
@@ -111,7 +111,7 @@ impl ForwardedRecord {
     pub fn any(&self) -> bool {
         self.value()
             .map(|v| v.any())
-            .or_else(|| self.raw().map(|bytes| bytes.is_empty()))
+            .or_else(|| self.raw().map(|bytes| !bytes.is_empty()))
             .unwrap()
     }
 
@@ -353,20 +353,20 @@ impl Forwarded {
 
         if let Some(host) = &self.host {
             bytes.put(&b"host="[..]);
-            bytes.put(host.to_bytes());
+            put_field_value(&mut bytes, &host.to_bytes());
             bytes.put_u8(b';');
         }
 
         if let Some(proto) = &self.proto {
             bytes.put(&b"proto="[..]);
-            bytes.put(proto.as_bytes());
+            put_field_value(&mut bytes, &proto.as_bytes());
             bytes.put_u8(b';');
         }
 
         for (key, value) in &self.extensions {
             bytes.put(key.as_bytes());
             bytes.put_u8(b'=');
-            bytes.put(value.as_bytes());
+            bytes.put(value.to_header_bytes());
             bytes.put_u8(b';');
         }
 
@@ -793,31 +793,20 @@ impl ForwardAddress {
     }
 
     /// Convert the `ForwardAddress` to a byte string.
+    ///
+    /// The result is a valid `Forwarded` field value: a bare IPv4 address is
+    /// emitted as a token, while anything containing `:` or `[` (IPv6, or any
+    /// address with a port) is emitted as a quoted-string, per RFC 7239 section 6.
     pub fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::new();
+        let node = match (&self.ip, self.port) {
+            (IpAddr::V4(ip), None) => ip.to_string(),
+            (IpAddr::V4(ip), Some(port)) => format!("{ip}:{port}"),
+            (IpAddr::V6(ip), None) => format!("[{ip}]"),
+            (IpAddr::V6(ip), Some(port)) => format!("[{ip}]:{port}"),
+        };
 
-        match &self.ip {
-            IpAddr::V4(ip) => {
-                bytes.put(ip.to_string().as_bytes());
-
-                if let Some(port) = &self.port {
-                    bytes.put_u8(b':');
-                    bytes.put(port.to_string().as_bytes());
-                }
-            }
-            IpAddr::V6(ip) => {
-                bytes.put_u8(b'"');
-                bytes.put_u8(b'[');
-                bytes.put(ip.to_string().as_bytes());
-                bytes.put_u8(b']');
-                if let Some(port) = &self.port {
-                    bytes.put_u8(b':');
-                    bytes.put(port.to_string().as_bytes());
-                }
-                bytes.put_u8(b'"');
-            }
-        }
-
+        let mut bytes = BytesMut::with_capacity(node.len() + 2);
+        put_field_value(&mut bytes, node.as_bytes());
         bytes.freeze()
     }
 
@@ -829,20 +818,8 @@ impl ForwardAddress {
 
 impl fmt::Display for ForwardAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.ip {
-            IpAddr::V4(ip) => write!(f, "{}", ip),
-            IpAddr::V6(ip) => write!(f, "\"[{}]", ip),
-        }?;
-
-        if let Some(port) = &self.port {
-            write!(f, ":{}", port)?;
-        }
-
-        if self.ip.is_ipv6() {
-            write!(f, "\"")
-        } else {
-            Ok(())
-        }
+        // `to_bytes` only ever produces ASCII.
+        f.write_str(&String::from_utf8_lossy(&self.to_bytes()))
     }
 }
 
@@ -1805,6 +1782,181 @@ mod tests {
                 r#for: Some(Forwardee::Address("192.0.2.4".parse().unwrap())),
                 ..Default::default()
             }
+        );
+    }
+
+    fn roundtrip(forwarded: &Forwarded) -> Forwarded {
+        Forwarded::parse_record(forwarded.to_bytes().as_ref()).unwrap_or_else(|error| {
+            panic!(
+                "failed to re-parse {:?}: {error}",
+                String::from_utf8_lossy(&forwarded.to_bytes())
+            )
+        })
+    }
+
+    #[test]
+    fn forward_address_quoting() {
+        let v4: IpAddr = Ipv4Addr::new(192, 0, 2, 1).into();
+        let v6: IpAddr = "2001:db8::17".parse().unwrap();
+
+        let cases = [
+            (ForwardAddress::from(v4), "192.0.2.1"),
+            (
+                ForwardAddress::from(v4).with_port(8080),
+                "\"192.0.2.1:8080\"",
+            ),
+            (ForwardAddress::from(v6), "\"[2001:db8::17]\""),
+            (
+                ForwardAddress::from(v6).with_port(8080),
+                "\"[2001:db8::17]:8080\"",
+            ),
+        ];
+
+        for (addr, expected) in cases {
+            assert_eq!(addr.to_bytes().as_ref(), expected.as_bytes());
+            assert_eq!(addr.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn forwarded_ipv4_with_port_roundtrip() {
+        let forwarded = Forwarded {
+            r#for: Some(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 8080).into()),
+            by: Some(SocketAddr::new(Ipv4Addr::new(203, 0, 113, 43).into(), 80).into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            forwarded.to_bytes().as_ref(),
+            b"by=\"203.0.113.43:80\";for=\"192.0.2.1:8080\""
+        );
+        assert_eq!(roundtrip(&forwarded), forwarded);
+    }
+
+    #[test]
+    fn forwarded_host_quoting() {
+        let cases = [
+            ("example.com", "host=example.com"),
+            ("example.com:8080", "host=\"example.com:8080\""),
+            ("[::1]", "host=\"[::1]\""),
+            ("[::1]:8080", "host=\"[::1]:8080\""),
+        ];
+
+        for (host, expected) in cases {
+            let forwarded = Forwarded {
+                host: Some(host.parse().unwrap()),
+                ..Default::default()
+            };
+            assert_eq!(forwarded.to_bytes().as_ref(), expected.as_bytes());
+            assert_eq!(roundtrip(&forwarded), forwarded);
+        }
+    }
+
+    #[test]
+    fn x_forwarded_host_is_not_quoted() {
+        let forwarded = Forwarded {
+            host: Some("example.com:8080".parse().unwrap()),
+            ..Default::default()
+        };
+
+        let mut request = http::Request::new(());
+        forwarded.set_x_forwarded_headers(&mut request);
+        assert_eq!(
+            request.headers().get(X_FORWARDED_HOST).unwrap(),
+            "example.com:8080"
+        );
+    }
+
+    #[test]
+    fn forwarded_quoted_extension_roundtrip() {
+        for input in [
+            "for=unknown;ext=\"a, b\"",
+            "for=unknown;ext=\"a;b=c\"",
+            r#"for=unknown;ext="say \"hi\"""#,
+            "for=unknown;ext=token",
+        ] {
+            let forwarded: Forwarded = input.parse().unwrap();
+            assert_eq!(forwarded.to_bytes().as_ref(), input.as_bytes());
+            assert_eq!(roundtrip(&forwarded), forwarded);
+        }
+    }
+
+    #[test]
+    fn forwarded_record_any_raw() {
+        let raw = ForwardedRecord::from(http::HeaderValue::from_static("not a valid record"));
+        assert!(raw.raw().is_some());
+        assert!(raw.any(), "non-empty raw record should be reported");
+
+        let empty = ForwardedRecord::from(http::HeaderValue::from_static(""));
+        assert_eq!(empty.raw(), Some(&b""[..]));
+        assert!(!empty.any(), "empty raw record should not be reported");
+    }
+
+    #[test]
+    fn forwarded_header_any_with_raw() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(FORWARDED, "not a valid record".parse().unwrap());
+        assert!(ForwardingChain::from_headers(&headers).any());
+    }
+
+    #[tokio::test]
+    async fn forwarded_header_service_ipv4_remote() {
+        let service = SetForwardedHeader::new(
+            tower::service_fn(|req: http::Request<()>| async { Ok::<_, ()>(req) }),
+            ForwardedHeaderConfig {
+                r#for: ForwardeeMode::Address,
+                ..Default::default()
+            },
+            false,
+            AppendHeaderRecordMode::Chain,
+        );
+
+        let mut request = http::Request::get("http://example.com").body(()).unwrap();
+        request
+            .headers_mut()
+            .insert(http::header::HOST, "example.com:8080".parse().unwrap());
+        request.extensions_mut().insert(RemoteAddress(
+            SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 51234).into(),
+        ));
+
+        let response = service.oneshot(request).await.unwrap();
+        let forwarded = response.headers().get(FORWARDED).unwrap();
+        assert_eq!(
+            forwarded,
+            "for=\"192.0.2.1:51234\";host=\"example.com:8080\";proto=http"
+        );
+
+        let chain = ForwardingChain::from_headers(response.headers());
+        assert!(
+            chain.flat_iter().all(|record| record.value().is_some()),
+            "emitted header should parse cleanly: {chain:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_header_service_preserves_quoted_values() {
+        let service = SetForwardedHeader::new(
+            tower::service_fn(|req: http::Request<()>| async { Ok::<_, ()>(req) }),
+            Default::default(),
+            false,
+            AppendHeaderRecordMode::Chain,
+        );
+
+        let upstream = "for=\"192.0.2.5:4711\";host=\"example.com:8080\";ext=\"a, b\"";
+
+        let mut request = http::Request::get("http://example.com").body(()).unwrap();
+        request
+            .headers_mut()
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        request
+            .headers_mut()
+            .insert(FORWARDED, upstream.parse().unwrap());
+
+        let response = service.oneshot(request).await.unwrap();
+        let forwarded = response.headers().get(FORWARDED).unwrap();
+        assert_eq!(
+            forwarded.to_str().unwrap(),
+            format!("{upstream}, for=unknown;host=example.com;proto=http")
         );
     }
 }

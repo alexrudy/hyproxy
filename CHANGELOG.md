@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Forwarded` header values that are not valid tokens are now quoted, as required by RFC 7239.
+  Previously, IPv4 addresses with a port (`for=192.0.2.1:8080`), hosts with a port
+  (`host=example.com:8080`) and IPv6 hosts were emitted unquoted, producing headers that
+  downstream servers (and hyproxy itself) could not parse.
+- Quoted extension values in an incoming `Forwarded` header (e.g. `ext="a, b"`) are no longer
+  stripped of their quotes when the header chain is re-serialized.
+- `ForwardedRecord::any` now returns `true` for non-empty unparsed (raw) records; the check was inverted.
+- `fields::combine_values` preserves quotes on quoted-string values, so its output round-trips
+  through `fields::parse_header`.
+
+### Changed
+
+- `ForwardAddress::to_bytes`, `ForwardAddress::as_header_value` and `ForwardAddress`'s `Display`
+  implementation now quote IPv4 addresses that include a port (`"192.0.2.1:8080"`).
+
+### Added
+
+- `FieldValue::to_header_bytes`, which returns the value in its serialized header form,
+  retaining the surrounding quotes for quoted strings.
+
 ## [0.12.0](https://github.com/alexrudy/hyproxy/compare/v0.11.2...v0.12.0) - 2026-06-05
 
 ### Other

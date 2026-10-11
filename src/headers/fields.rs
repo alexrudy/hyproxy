@@ -4,7 +4,7 @@
 //! defined in [RFC 7230](https://tools.ietf.org/html/rfc7230#section-3.2.6).
 use core::fmt;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
 use super::parser::{quoted_text, record, records, token, NoTail as _};
@@ -43,7 +43,7 @@ where
     I: IntoIterator<Item = &'a FieldValue>,
 {
     iter.into_iter()
-        .map(|v| v.as_bytes().to_vec())
+        .map(|v| v.to_header_bytes().to_vec())
         .collect::<Vec<_>>()
         .join([delimiter, b' '].as_slice())
 }
@@ -58,6 +58,23 @@ impl FieldValue {
         match &self.0 {
             Entry::Token(token) => token.as_bytes(),
             Entry::QuotedText(quoted) => quoted.as_bytes(),
+        }
+    }
+
+    /// Get the field value in its serialized header form.
+    ///
+    /// Unlike [`FieldValue::as_bytes`], quoted strings retain their surrounding
+    /// double quotes, so the result can be written back into a header verbatim.
+    pub fn to_header_bytes(&self) -> Bytes {
+        match &self.0 {
+            Entry::Token(token) => token.0.clone(),
+            Entry::QuotedText(quoted) => {
+                let mut bytes = BytesMut::with_capacity(quoted.0.len() + 2);
+                bytes.put_u8(b'"');
+                bytes.put(quoted.as_bytes());
+                bytes.put_u8(b'"');
+                bytes.freeze()
+            }
         }
     }
 
@@ -279,5 +296,31 @@ impl fmt::Debug for QuotedText {
         f.debug_tuple("QuotedText")
             .field(&String::from_utf8_lossy(&self.0))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_header_bytes_keeps_quotes() {
+        let token = parse_field(b"abc").unwrap();
+        assert_eq!(token.to_header_bytes().as_ref(), b"abc");
+
+        let quoted = parse_field(br#""a, \"b\"""#).unwrap();
+        assert_eq!(quoted.as_bytes(), br#"a, \"b\""#);
+        assert_eq!(quoted.to_header_bytes().as_ref(), br#""a, \"b\"""#);
+    }
+
+    #[test]
+    fn combine_values_roundtrip() {
+        let input = br#"abc, "d, e", "f\"g""#;
+        let values = parse_header(input, b',').unwrap();
+        assert_eq!(values.len(), 3);
+
+        let combined = combine_values(&values, b',');
+        assert_eq!(combined, input);
+        assert_eq!(parse_header(&combined, b',').unwrap(), values);
     }
 }
