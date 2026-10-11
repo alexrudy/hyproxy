@@ -57,6 +57,10 @@ impl ForwardingChain {
     }
 
     /// Set the `X-Forwarded-*` headers on a request.
+    ///
+    /// Every `for` address in the chain is appended to `X-Forwarded-For`, while
+    /// `X-Forwarded-Host` and `X-Forwarded-Proto` are taken from the first record
+    /// that has them, unless already present. See [`Forwarded::set_x_forwarded_headers`].
     pub fn set_all_x_forwarded_headers<B>(&self, request: &mut http::Request<B>) {
         for record in self.flat_iter() {
             record.set_x_forwarded_headers(request);
@@ -90,7 +94,7 @@ impl ForwardedHeader {
 
     /// Set the `X-Forwarded-*` headers on a request.
     ///
-    /// This will skip unparsed raw values.
+    /// This will skip unparsed raw values. See [`ForwardingChain::set_all_x_forwarded_headers`].
     pub fn set_all_x_forwarded_headers<B>(&self, request: &mut http::Request<B>) {
         for record in self.iter() {
             record.set_x_forwarded_headers(request);
@@ -146,6 +150,19 @@ pub struct RemoteAddress(pub ForwardAddress);
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LocalAddress(pub ForwardAddress);
 
+/// The scheme of the connection the request arrived on (`http` or `https`).
+///
+/// When present in the http::Request extensions, this is used for the
+/// `proto` field of the `Forwarded` header. It takes precedence over the
+/// request URI's scheme, which describes the request target rather than the
+/// connection, and is usually absent for HTTP/1.1 requests.
+///
+/// [`ConnectionInfoAdapter`] inserts `https` when TLS connection info is
+/// available. Servers that only accept plaintext connections should insert
+/// `ConnectionScheme(Scheme::HTTP)` themselves.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ConnectionScheme(pub http::uri::Scheme);
+
 #[cfg(feature = "hyperdriver")]
 pub use self::info::{ConnectionInfoAdapter, ConnectionInfoAdapterLayer};
 
@@ -153,9 +170,10 @@ pub use self::info::{ConnectionInfoAdapter, ConnectionInfoAdapterLayer};
 mod info {
     use std::net::SocketAddr;
 
+    use chateau::info::TlsConnectionInfo;
     use hyperdriver::info::ConnectionInfo;
 
-    use super::{LocalAddress, RemoteAddress};
+    use super::{ConnectionScheme, LocalAddress, RemoteAddress};
 
     /// A layer that wraps a service with a [`ConnectionInfoAdapter`].
     ///
@@ -178,6 +196,11 @@ mod info {
     /// This adapts the hyperdriver-specific [`ConnectionInfo`] object
     /// and provides the hyproxy-specific [`RemoteAddress`] and [`LocalAddress`]
     /// for use in the Forward headers.
+    ///
+    /// If the request carries [`TlsConnectionInfo`] (see hyperdriver's
+    /// `with_tls_connection_info`), this also inserts
+    /// [`ConnectionScheme`]`(https)`. Without TLS connection info, the scheme
+    /// cannot be determined, and no [`ConnectionScheme`] is inserted.
     #[derive(Debug, Default, Clone)]
     pub struct ConnectionInfoAdapter<S> {
         service: S,
@@ -230,6 +253,11 @@ mod info {
                 tracing::warn!("Connection info not found")
             }
 
+            if req.extensions().get::<TlsConnectionInfo>().is_some() {
+                req.extensions_mut()
+                    .insert(ConnectionScheme(http::uri::Scheme::HTTPS));
+            }
+
             self.service.call(req)
         }
     }
@@ -263,6 +291,11 @@ impl Forwarded {
     /// This should receive the request sent to the proxy server, and will extract the necessary information from it.
     /// It expects that the request has been processed by some middleware that adds the `RemoteAddress` extension,
     /// and optionally the local address.
+    ///
+    /// - `host` is taken from the `Host` header, falling back to the request URI's
+    ///   authority (which is where HTTP/2 carries `:authority`).
+    /// - `proto` is taken from the [`ConnectionScheme`] extension, falling back to
+    ///   the request URI's scheme.
     pub fn new<B>(request: &http::Request<B>) -> Self {
         let mut by = None;
         let mut r#for = None;
@@ -277,15 +310,19 @@ impl Forwarded {
             by = Some(Forwardee::address(local.0));
         }
 
-        if let Some(host_header) = request
-            .headers()
-            .get(http::header::HOST)
-            .and_then(|h| ForwardedHost::parse_bytes(h.as_bytes()).ok())
-        {
-            host = Some(host_header);
+        if let Some(header) = request.headers().get(http::header::HOST) {
+            host = ForwardedHost::parse_bytes(header.as_bytes()).ok();
+        } else if let Some(authority) = request.uri().authority() {
+            // Userinfo is not part of the host, so build from the parts rather than parsing.
+            host = Some(ForwardedHost::new(
+                authority.host().to_string(),
+                authority.port_u16(),
+            ));
         }
 
-        if let Some(scheme) = request.uri().scheme() {
+        if let Some(ConnectionScheme(scheme)) = request.extensions().get::<ConnectionScheme>() {
+            proto = Some(scheme.clone().into());
+        } else if let Some(scheme) = request.uri().scheme() {
             proto = Some(scheme.clone().into());
         }
 
@@ -307,7 +344,11 @@ impl Forwarded {
     ///
     /// When no fields are set, the `Forwarded` header should not be included in the request.
     pub fn any(&self) -> bool {
-        self.by.is_some() || self.r#for.is_some() || self.host.is_some() || self.proto.is_some()
+        self.by.is_some()
+            || self.r#for.is_some()
+            || self.host.is_some()
+            || self.proto.is_some()
+            || !self.extensions.is_empty()
     }
 
     /// Remove the `by` field from the `Forwarded` header.
@@ -316,24 +357,64 @@ impl Forwarded {
     }
 
     /// Set the `X-Forwarded-*` headers on a request.
+    ///
+    /// This is equivalent to [`Forwarded::append_x_forwarded_headers`] with
+    /// [`AppendHeaderRecordMode::Append`]: the `for` address is appended to
+    /// `X-Forwarded-For`, while `X-Forwarded-Host` and `X-Forwarded-Proto` are
+    /// only set if they are not already present.
     pub fn set_x_forwarded_headers<B>(&self, request: &mut http::Request<B>) {
-        if let Some(r#for) = self.r#for.as_ref().and_then(|r#for| r#for.x_forwarded()) {
-            request
-                .headers_mut()
-                .append(X_FORWARDED_FOR, r#for.header_value());
-        }
+        self.append_x_forwarded_headers(&AppendHeaderRecordMode::Append, request.headers_mut());
+    }
 
-        if let Some(host) = &self.host {
-            request
-                .headers_mut()
-                .append(X_FORWARDED_HOST, host.x_forwarded().as_header_value());
-        }
+    /// Set the `X-Forwarded-*` headers, treating any existing values according to `mode`.
+    ///
+    /// The mode expresses how much the upstream values are trusted, and is
+    /// applied the same way as for the `Forwarded` header chain.
+    ///
+    /// `X-Forwarded-For` is a list, so each comma-separated entry is treated as a record:
+    ///
+    /// | Mode        | `X-Forwarded-For`                                     |
+    /// |-------------|-------------------------------------------------------|
+    /// | `Append`    | Our address is added as a new header line.            |
+    /// | `Chain`     | Our address is added to the last header line.         |
+    /// | `Flatten`   | All entries, then ours, are combined into one line.   |
+    /// | `Expand`    | Each entry, then ours, gets its own header line.      |
+    /// | `KeepFirst` | Only the first existing entry is kept, or ours if none. |
+    /// | `KeepLast`  | Only our address is kept.                             |
+    /// | `Omit`      | The header is removed.                                |
+    ///
+    /// `X-Forwarded-Host` and `X-Forwarded-Proto` describe the original client
+    /// request, and are conventionally single-valued:
+    ///
+    /// | Mode                                       | `X-Forwarded-Host` / `X-Forwarded-Proto`      |
+    /// |--------------------------------------------|-----------------------------------------------|
+    /// | `Append`, `Chain`, `Flatten`, `Expand`     | An existing value is kept; otherwise ours is set. |
+    /// | `KeepFirst`                                | Only the first existing entry is kept; otherwise ours is set. |
+    /// | `KeepLast`                                 | Existing values are replaced by ours.         |
+    /// | `Omit`                                     | The header is removed.                        |
+    pub fn append_x_forwarded_headers(
+        &self,
+        mode: &AppendHeaderRecordMode,
+        headers: &mut http::HeaderMap,
+    ) {
+        let r#for = self
+            .r#for
+            .as_ref()
+            .and_then(Forwardee::x_forwarded)
+            .map(|r#for| r#for.header_value());
+        append_x_forwarded_list(mode, X_FORWARDED_FOR, r#for, headers);
 
-        if let Some(proto) = &self.proto {
-            request
-                .headers_mut()
-                .append(X_FORWARDED_PROTO, proto.x_forwarded().as_header_value());
-        }
+        let host = self
+            .host
+            .as_ref()
+            .map(|host| host.x_forwarded().as_header_value());
+        append_x_forwarded_single(mode, X_FORWARDED_HOST, host, headers);
+
+        let proto = self
+            .proto
+            .as_ref()
+            .map(|proto| proto.x_forwarded().as_header_value());
+        append_x_forwarded_single(mode, X_FORWARDED_PROTO, proto, headers);
     }
 
     /// Convert this `Forwarded` header to a byte string.
@@ -399,6 +480,159 @@ impl Forwarded {
             request
                 .headers_mut()
                 .append("forwarded", self.to_header_value());
+        }
+    }
+}
+
+/// Split all values of a comma-separated list header into trimmed, non-empty entries.
+fn x_forwarded_entries(headers: &http::HeaderMap, name: &http::HeaderName) -> Vec<Vec<Vec<u8>>> {
+    headers
+        .get_all(name)
+        .iter()
+        .map(|value| {
+            value
+                .as_bytes()
+                .split(|&c| c == b',')
+                .map(<[u8]>::trim_ascii)
+                .filter(|entry| !entry.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect()
+        })
+        .collect()
+}
+
+fn join_x_forwarded_entries<'a, I>(entries: I) -> Option<http::HeaderValue>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let joined = entries.into_iter().collect::<Vec<_>>().join(&b", "[..]);
+    if joined.is_empty() {
+        return None;
+    }
+
+    // Entries are sub-slices of valid header values (or our own values), so
+    // joining them with ", " always produces a valid header value.
+    http::HeaderValue::from_bytes(&joined).ok()
+}
+
+/// The first entry of the first value of `name`, if any.
+fn first_x_forwarded_entry(
+    headers: &http::HeaderMap,
+    name: &http::HeaderName,
+) -> Option<http::HeaderValue> {
+    x_forwarded_entries(headers, name)
+        .into_iter()
+        .flatten()
+        .next()
+        .and_then(|entry| http::HeaderValue::from_bytes(&entry).ok())
+}
+
+fn append_x_forwarded_list(
+    mode: &AppendHeaderRecordMode,
+    name: http::HeaderName,
+    ours: Option<http::HeaderValue>,
+    headers: &mut http::HeaderMap,
+) {
+    use AppendHeaderRecordMode as Mode;
+
+    match mode {
+        Mode::Append => {
+            if let Some(ours) = ours {
+                headers.append(name, ours);
+            }
+        }
+        Mode::Chain => {
+            let Some(ours) = ours else { return };
+            let mut values: Vec<_> = headers.get_all(&name).iter().cloned().collect();
+            let last = values
+                .pop()
+                .and_then(|last| join_x_forwarded_entries([last.as_bytes(), ours.as_bytes()]))
+                .unwrap_or(ours);
+
+            headers.remove(&name);
+            for value in values {
+                headers.append(&name, value);
+            }
+            headers.append(name, last);
+        }
+        Mode::Flatten => {
+            let entries = x_forwarded_entries(headers, &name);
+            let joined = join_x_forwarded_entries(
+                entries
+                    .iter()
+                    .flatten()
+                    .map(Vec::as_slice)
+                    .chain(ours.as_ref().map(http::HeaderValue::as_bytes)),
+            );
+
+            headers.remove(&name);
+            if let Some(joined) = joined {
+                headers.insert(name, joined);
+            }
+        }
+        Mode::Expand => {
+            let entries = x_forwarded_entries(headers, &name);
+
+            headers.remove(&name);
+            for entry in entries.iter().flatten() {
+                if let Ok(value) = http::HeaderValue::from_bytes(entry) {
+                    headers.append(&name, value);
+                }
+            }
+            if let Some(ours) = ours {
+                headers.append(name, ours);
+            }
+        }
+        Mode::KeepFirst => {
+            let value = first_x_forwarded_entry(headers, &name).or(ours);
+            headers.remove(&name);
+            if let Some(value) = value {
+                headers.insert(name, value);
+            }
+        }
+        Mode::KeepLast => {
+            headers.remove(&name);
+            if let Some(ours) = ours {
+                headers.insert(name, ours);
+            }
+        }
+        Mode::Omit => {
+            headers.remove(&name);
+        }
+    }
+}
+
+fn append_x_forwarded_single(
+    mode: &AppendHeaderRecordMode,
+    name: http::HeaderName,
+    ours: Option<http::HeaderValue>,
+    headers: &mut http::HeaderMap,
+) {
+    use AppendHeaderRecordMode as Mode;
+
+    match mode {
+        Mode::Append | Mode::Chain | Mode::Flatten | Mode::Expand => {
+            if let Some(ours) = ours {
+                if !headers.contains_key(&name) {
+                    headers.insert(name, ours);
+                }
+            }
+        }
+        Mode::KeepFirst => {
+            let value = first_x_forwarded_entry(headers, &name).or(ours);
+            headers.remove(&name);
+            if let Some(value) = value {
+                headers.insert(name, value);
+            }
+        }
+        Mode::KeepLast => {
+            headers.remove(&name);
+            if let Some(ours) = ours {
+                headers.insert(name, ours);
+            }
+        }
+        Mode::Omit => {
+            headers.remove(&name);
         }
     }
 }
@@ -620,6 +854,9 @@ enum ParseForwadingErrorKind {
         #[source]
         error: http::uri::InvalidUri,
     },
+
+    #[error("invalid host for FORWARDED (host): userinfo is not permitted")]
+    HostWithUserinfo,
 
     #[error("invalid host for FORWARDED (host): {error}")]
     NonUtf8Host {
@@ -1265,17 +1502,26 @@ impl ForwardedHost {
         let value = std::str::from_utf8(value).map_err(|error| ParseForwardedError {
             kind: ParseForwadingErrorKind::NonUtf8Host { error },
         })?;
-        Self::from_str(value).map_err(|error| ParseForwardedError {
-            kind: ParseForwadingErrorKind::InvalidHost { error },
-        })
+        Self::from_str(value)
     }
 }
 
 impl FromStr for ForwardedHost {
-    type Err = http::uri::InvalidUri;
+    type Err = ParseForwardedError;
 
+    /// Parse a `Host` header value: `uri-host [ ":" port ]` (RFC 9110 section 7.2).
+    ///
+    /// Unlike a URI authority, this does not permit userinfo (`user@host`).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let authority = http::uri::Authority::from_str(s)?;
+        if s.contains('@') {
+            return Err(ParseForwardedError {
+                kind: ParseForwadingErrorKind::HostWithUserinfo,
+            });
+        }
+
+        let authority = http::uri::Authority::from_str(s).map_err(|error| ParseForwardedError {
+            kind: ParseForwadingErrorKind::InvalidHost { error },
+        })?;
         Ok(ForwardedHost {
             host: authority.host().to_string(),
             port: authority.port_u16(),
@@ -1447,7 +1693,7 @@ impl<S> SetForwardedHeader<S> {
         let forward = self.config.from_request(req);
 
         if self.set_x_headers {
-            forward.set_x_forwarded_headers(req);
+            forward.append_x_forwarded_headers(&self.append, req.headers_mut());
         }
 
         ForwardingChain::append_record(&self.append, forward, req.headers_mut());
@@ -1511,12 +1757,22 @@ impl SetForwardedHeaderLayer {
     }
 
     /// Set whether to include the `X-Forwarded-*` headers.
+    ///
+    /// When enabled, existing `X-Forwarded-*` headers are handled according to
+    /// the [`AppendHeaderRecordMode`] (see [`Self::append_forwarded_headers`]),
+    /// as described in [`Forwarded::append_x_forwarded_headers`]. When disabled,
+    /// existing `X-Forwarded-*` headers are left untouched.
     pub fn set_x_headers(mut self, set_x_headers: bool) -> Self {
         self.set_x_headers = set_x_headers;
         self
     }
 
-    /// Set wether to collect the `Forwarded` headers into a chain.
+    /// Set how the new `Forwarded` record is combined with existing ones.
+    ///
+    /// This also expresses how far upstream proxies are trusted, and so applies
+    /// to the `X-Forwarded-*` headers too, when they are enabled. For example,
+    /// [`AppendHeaderRecordMode::KeepLast`] discards all upstream values, which
+    /// is appropriate for a proxy at the edge of the network.
     pub fn append_forwarded_headers(mut self, append: AppendHeaderRecordMode) -> Self {
         self.append = append;
         self
@@ -2459,6 +2715,343 @@ mod tests {
         let mut request = http::Request::new(());
         forwarded.set_x_forwarded_headers(&mut request);
         assert!(request.headers().get(X_FORWARDED_FOR).is_none());
+    }
+
+    #[test]
+    fn forwarded_host_from_uri_authority() {
+        // HTTP/2 carries the host in `:authority`, which hyper puts in the URI.
+        let request = http::Request::get("https://example.com:8443/path")
+            .body(())
+            .unwrap();
+        let forwarded = Forwarded::new(&request);
+        assert_eq!(
+            forwarded.host,
+            Some(ForwardedHost::new("example.com".into(), Some(8443)))
+        );
+
+        let request = http::Request::get("https://user:pw@example.com/")
+            .body(())
+            .unwrap();
+        let forwarded = Forwarded::new(&request);
+        assert_eq!(
+            forwarded.host,
+            Some(ForwardedHost::new("example.com".into(), None)),
+            "userinfo is not part of the host"
+        );
+    }
+
+    #[test]
+    fn forwarded_host_header_takes_precedence() {
+        let request = http::Request::get("https://authority.example/")
+            .header(http::header::HOST, "header.example")
+            .body(())
+            .unwrap();
+        let forwarded = Forwarded::new(&request);
+        assert_eq!(
+            forwarded.host,
+            Some(ForwardedHost::new("header.example".into(), None))
+        );
+    }
+
+    #[test]
+    fn forwarded_proto_from_connection_scheme() {
+        // HTTP/1.1 origin-form requests have no scheme in the URI.
+        let mut request = http::Request::get("/path").body(()).unwrap();
+        assert_eq!(Forwarded::new(&request).proto, None);
+
+        request
+            .extensions_mut()
+            .insert(ConnectionScheme(http::uri::Scheme::HTTP));
+        assert_eq!(
+            Forwarded::new(&request).proto,
+            Some(http::uri::Scheme::HTTP.into())
+        );
+
+        // The connection scheme describes how the request reached us, so it
+        // wins over the scheme of an absolute-form target.
+        let mut request = http::Request::get("http://example.com/").body(()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectionScheme(http::uri::Scheme::HTTPS));
+        assert_eq!(
+            Forwarded::new(&request).proto,
+            Some(http::uri::Scheme::HTTPS.into())
+        );
+    }
+
+    #[test]
+    fn forwarded_host_rejects_userinfo() {
+        for input in [
+            "user@example.com",
+            "user:pw@example.com:8080",
+            "@example.com",
+        ] {
+            assert!(input.parse::<ForwardedHost>().is_err(), "{input}");
+            assert!(
+                format!("host=\"{input}\"").parse::<Forwarded>().is_err(),
+                "{input}"
+            );
+        }
+
+        let request = http::Request::get("/")
+            .header(http::header::HOST, "user@example.com")
+            .body(())
+            .unwrap();
+        assert_eq!(Forwarded::new(&request).host, None);
+    }
+
+    #[test]
+    fn forwarded_any_with_extensions() {
+        let forwarded: Forwarded = "ext=value".parse().unwrap();
+        assert!(forwarded.any());
+
+        let mut request = http::Request::new(());
+        forwarded.set_header(&mut request);
+        assert_eq!(request.headers().get(FORWARDED).unwrap(), "ext=value");
+
+        assert!(!Forwarded::default().any());
+    }
+
+    #[cfg(feature = "hyperdriver")]
+    #[tokio::test]
+    async fn connection_info_adapter_sets_scheme_for_tls() {
+        use chateau::info::TlsConnectionInfo;
+
+        let service =
+            ConnectionInfoAdapter::new(tower::service_fn(|req: http::Request<()>| async move {
+                Ok::<_, ()>(req.extensions().get::<ConnectionScheme>().cloned())
+            }));
+
+        let mut request = http::Request::new(());
+        request
+            .extensions_mut()
+            .insert(TlsConnectionInfo::default());
+        assert_eq!(
+            service.clone().oneshot(request).await.unwrap(),
+            Some(ConnectionScheme(http::uri::Scheme::HTTPS))
+        );
+
+        let request = http::Request::new(());
+        assert_eq!(service.oneshot(request).await.unwrap(), None);
+    }
+
+    fn ours() -> Forwarded {
+        Forwarded {
+            r#for: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)).into()),
+            host: Some("ours.example".parse().unwrap()),
+            proto: Some(http::uri::Scheme::HTTP.into()),
+            ..Default::default()
+        }
+    }
+
+    fn upstream_x_headers() -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.append(X_FORWARDED_FOR, "192.0.2.1, 192.0.2.2".parse().unwrap());
+        headers.append(X_FORWARDED_FOR, "192.0.2.3".parse().unwrap());
+        headers.insert(X_FORWARDED_HOST, "upstream.example".parse().unwrap());
+        headers.insert(X_FORWARDED_PROTO, "https".parse().unwrap());
+        headers
+    }
+
+    fn values(headers: &http::HeaderMap, name: &http::HeaderName) -> Vec<String> {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn x_forwarded_modes_with_upstream_values() {
+        use AppendHeaderRecordMode as Mode;
+
+        let upstream = ("upstream.example", "https");
+        let replaced = ("ours.example", "http");
+
+        /// Mode, expected `X-Forwarded-For` lines, and expected (host, proto).
+        type Case<'a> = (Mode, &'a [&'a str], Option<(&'a str, &'a str)>);
+
+        let cases: [Case<'_>; 7] = [
+            (
+                Mode::Append,
+                &["192.0.2.1, 192.0.2.2", "192.0.2.3", "198.51.100.1"],
+                Some(upstream),
+            ),
+            (
+                Mode::Chain,
+                &["192.0.2.1, 192.0.2.2", "192.0.2.3, 198.51.100.1"],
+                Some(upstream),
+            ),
+            (
+                Mode::Flatten,
+                &["192.0.2.1, 192.0.2.2, 192.0.2.3, 198.51.100.1"],
+                Some(upstream),
+            ),
+            (
+                Mode::Expand,
+                &["192.0.2.1", "192.0.2.2", "192.0.2.3", "198.51.100.1"],
+                Some(upstream),
+            ),
+            (Mode::KeepFirst, &["192.0.2.1"], Some(upstream)),
+            (Mode::KeepLast, &["198.51.100.1"], Some(replaced)),
+            (Mode::Omit, &[], None),
+        ];
+
+        for (mode, expected_for, expected_single) in cases {
+            let mut headers = upstream_x_headers();
+            ours().append_x_forwarded_headers(&mode, &mut headers);
+
+            assert_eq!(values(&headers, &X_FORWARDED_FOR), expected_for, "{mode:?}");
+
+            let (host, proto) = match expected_single {
+                Some((host, proto)) => (vec![host], vec![proto]),
+                None => (vec![], vec![]),
+            };
+            assert_eq!(values(&headers, &X_FORWARDED_HOST), host, "{mode:?}");
+            assert_eq!(values(&headers, &X_FORWARDED_PROTO), proto, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn x_forwarded_modes_without_upstream_values() {
+        use AppendHeaderRecordMode as Mode;
+
+        for mode in [
+            Mode::Append,
+            Mode::Chain,
+            Mode::Flatten,
+            Mode::Expand,
+            Mode::KeepFirst,
+            Mode::KeepLast,
+        ] {
+            let mut headers = http::HeaderMap::new();
+            ours().append_x_forwarded_headers(&mode, &mut headers);
+
+            assert_eq!(
+                values(&headers, &X_FORWARDED_FOR),
+                ["198.51.100.1"],
+                "{mode:?}"
+            );
+            assert_eq!(
+                values(&headers, &X_FORWARDED_HOST),
+                ["ours.example"],
+                "{mode:?}"
+            );
+            assert_eq!(values(&headers, &X_FORWARDED_PROTO), ["http"], "{mode:?}");
+        }
+
+        let mut headers = http::HeaderMap::new();
+        ours().append_x_forwarded_headers(&Mode::Omit, &mut headers);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn x_forwarded_keep_last_without_our_values_removes_upstream() {
+        // Upstream values are untrusted under KeepLast, even if we have nothing to replace them with.
+        let mut headers = upstream_x_headers();
+        Forwarded::default()
+            .append_x_forwarded_headers(&AppendHeaderRecordMode::KeepLast, &mut headers);
+        assert!(headers.is_empty(), "{headers:?}");
+    }
+
+    #[test]
+    fn x_forwarded_keep_first_splits_combined_values() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(X_FORWARDED_PROTO, " https , http".parse().unwrap());
+        headers.insert(X_FORWARDED_HOST, "a.example, b.example".parse().unwrap());
+
+        ours().append_x_forwarded_headers(&AppendHeaderRecordMode::KeepFirst, &mut headers);
+        assert_eq!(values(&headers, &X_FORWARDED_PROTO), ["https"]);
+        assert_eq!(values(&headers, &X_FORWARDED_HOST), ["a.example"]);
+    }
+
+    #[test]
+    fn x_forwarded_chain_does_not_duplicate_single_values() {
+        let chain: ForwardingChain = [
+            "for=192.0.2.1;host=a.example;proto=https"
+                .parse::<Forwarded>()
+                .unwrap(),
+            "for=192.0.2.2;host=b.example;proto=http".parse().unwrap(),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut request = http::Request::new(());
+        chain.set_all_x_forwarded_headers(&mut request);
+        let headers = request.headers();
+        assert_eq!(
+            values(headers, &X_FORWARDED_FOR),
+            ["192.0.2.1", "192.0.2.2"]
+        );
+        assert_eq!(values(headers, &X_FORWARDED_HOST), ["a.example"]);
+        assert_eq!(values(headers, &X_FORWARDED_PROTO), ["https"]);
+    }
+
+    async fn x_forwarded_service_response(
+        mode: AppendHeaderRecordMode,
+        set_x_headers: bool,
+    ) -> http::HeaderMap {
+        let service = SetForwardedHeader::new(
+            tower::service_fn(|req: http::Request<()>| async { Ok::<_, ()>(req) }),
+            ForwardedHeaderConfig {
+                r#for: ForwardeeMode::Address,
+                ..Default::default()
+            },
+            set_x_headers,
+            mode,
+        );
+
+        // A request which reached us over plaintext from a TLS-terminating load balancer.
+        let mut request = http::Request::get("/").body(()).unwrap();
+        request
+            .headers_mut()
+            .insert(http::header::HOST, "example.com".parse().unwrap());
+        request
+            .extensions_mut()
+            .insert(ConnectionScheme(http::uri::Scheme::HTTP));
+        request.extensions_mut().insert(RemoteAddress(
+            SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 4000).into(),
+        ));
+        *request.headers_mut() = {
+            let mut headers = upstream_x_headers();
+            headers.extend(request.headers().clone());
+            headers
+        };
+
+        service.oneshot(request).await.unwrap().headers().clone()
+    }
+
+    #[tokio::test]
+    async fn x_forwarded_service_trusts_upstream_when_chaining() {
+        let headers = x_forwarded_service_response(AppendHeaderRecordMode::Append, true).await;
+        assert_eq!(
+            values(&headers, &X_FORWARDED_FOR),
+            ["192.0.2.1, 192.0.2.2", "192.0.2.3", "10.0.0.1"]
+        );
+        assert_eq!(values(&headers, &X_FORWARDED_HOST), ["upstream.example"]);
+        assert_eq!(values(&headers, &X_FORWARDED_PROTO), ["https"]);
+    }
+
+    #[tokio::test]
+    async fn x_forwarded_service_replaces_upstream_when_keep_last() {
+        let headers = x_forwarded_service_response(AppendHeaderRecordMode::KeepLast, true).await;
+        assert_eq!(values(&headers, &X_FORWARDED_FOR), ["10.0.0.1"]);
+        assert_eq!(values(&headers, &X_FORWARDED_HOST), ["example.com"]);
+        assert_eq!(values(&headers, &X_FORWARDED_PROTO), ["http"]);
+    }
+
+    #[tokio::test]
+    async fn x_forwarded_service_untouched_when_disabled() {
+        for mode in [
+            AppendHeaderRecordMode::KeepLast,
+            AppendHeaderRecordMode::Omit,
+        ] {
+            let headers = x_forwarded_service_response(mode.clone(), false).await;
+            let upstream = upstream_x_headers();
+            for name in [&X_FORWARDED_FOR, &X_FORWARDED_HOST, &X_FORWARDED_PROTO] {
+                assert_eq!(values(&headers, name), values(&upstream, name), "{mode:?}");
+            }
+        }
     }
 
     #[test]

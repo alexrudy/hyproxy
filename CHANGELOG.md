@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ports (`"[2001:db8::17]:_p0rt"`) and ports on `unknown` and obfuscated names
   (`"unknown:8080"`, `"_hidden:_port"`). Previously these caused the whole header value to be
   treated as an unparsed raw record.
+- `Forwarded::new` (and so `SetForwardedHeader`) now falls back to the request URI's authority
+  for `host` when there is no `Host` header, so `host` is populated for HTTP/2 requests.
+- `X-Forwarded-Host` and `X-Forwarded-Proto` are no longer appended to existing values, which
+  produced ambiguous multi-valued headers such as `X-Forwarded-Proto: https, http`.
+- `Forwarded::any` now considers extension parameters, so a record with only extensions is no
+  longer dropped by `Forwarded::set_header`.
 
 ### Changed
 
@@ -45,6 +51,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the IP address.
 - **Breaking:** `ForwardeeMode::Named` has been renamed to `ForwardeeMode::Obfuscated`, matching
   the RFC 7239 terminology and `NodeName::Obfuscated`.
+- **Breaking:** `ForwardedHost`'s `FromStr::Err` is now `ParseForwardedError` (was
+  `http::uri::InvalidUri`). Host values containing userinfo (`user@example.com`) are now
+  rejected rather than having the userinfo silently dropped, as the `Host` header grammar
+  does not permit it.
+- `proto` in `Forwarded::new` now prefers the new `ConnectionScheme` request extension over the
+  request URI's scheme, since the URI scheme describes the request target rather than the
+  connection, and is absent for most HTTP/1.1 requests.
+- `SetForwardedHeader` now applies its `AppendHeaderRecordMode` to existing `X-Forwarded-*`
+  headers (when `set_x_headers` is enabled), so the X-headers follow the same trust policy as the
+  `Forwarded` chain:
+  - `Append`, `Chain`, `Flatten` and `Expand` add our address to `X-Forwarded-For` (combined as the
+    mode describes), and keep any existing `X-Forwarded-Host`/`X-Forwarded-Proto`.
+  - `KeepFirst` keeps only the first existing entry of each header, falling back to ours.
+  - `KeepLast` replaces all existing values with ours (appropriate at the network edge).
+  - `Omit` removes the `X-Forwarded-*` headers.
+- `Forwarded::set_x_forwarded_headers` (and the chain-level `set_all_x_forwarded_headers`) now
+  behave like the `Append` mode above: `X-Forwarded-Host`/`X-Forwarded-Proto` are only set if
+  not already present.
+- The `hyperdriver` feature now also enables an optional dependency on `chateau` (already a
+  dependency of `hyperdriver`), to read TLS connection info.
 - `ForwardAddress::from_str` now rejects nodes that are valid but cannot be represented as an IP
   address with a numeric port (e.g. `unknown`, `_hidden`, or an obfuscated port).
 - `ForwardAddress::to_bytes`, `ForwardAddress::as_header_value` and `ForwardAddress`'s `Display`
@@ -63,6 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `NodeName` and `NodePort` types, and `Forwardee::{new, address, obfuscated, unknown, name, port,
   ip, with_port, without_port}`.
 - `FromStr` and `Display` for `Forwardee`, `NodeName` and `NodePort`.
+- `Forwarded::append_x_forwarded_headers`, which sets the `X-Forwarded-*` headers according to an
+  `AppendHeaderRecordMode`.
+- `ConnectionScheme` request extension, used for the `proto` field of the `Forwarded` header.
+  `ConnectionInfoAdapter` inserts `ConnectionScheme(https)` when TLS connection info is present.
 
 ## [0.12.0](https://github.com/alexrudy/hyproxy/compare/v0.11.2...v0.12.0) - 2026-06-05
 
